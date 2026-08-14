@@ -53,7 +53,7 @@ func New(cfg *config.Config) (*App, error) {
 		return nil, fmt.Errorf("app: build registry: %w", err)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
 
 	tr := tools.New()
 	if err := tools.RegisterBuiltin(tr); err != nil {
@@ -66,11 +66,12 @@ func New(cfg *config.Config) (*App, error) {
 	}
 
 	handler := api.NewServer(api.Deps{
-		Providers: providers,
-		Registry:  registry,
-		Logger:    logger,
-		Tools:     tr,
-		ClientKey: cfg.Server.ClientKey,
+		Providers:          providers,
+		Registry:           registry,
+		Logger:             logger,
+		Tools:              tr,
+		ClientKey:          cfg.Server.ClientKey,
+		ReasoningCachePath: os.Getenv("REASONING_CACHE_FILE"),
 	})
 
 	addr := cfg.Addr()
@@ -85,6 +86,21 @@ func New(cfg *config.Config) (*App, error) {
 		logger:    logger,
 		mcClients: mcClients,
 	}, nil
+}
+
+// logLevel resolves the LOG_LEVEL env var (debug/info/warn/error) to a slog
+// level; unset or unknown values default to info.
+func logLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // remoteCall returns a tools.RemoteFunc that proxies a tool invocation to an

@@ -123,9 +123,34 @@ models:
 `cooldown` is an optional per-model failure-cooldown window (default `30s`).
 It applies **only to HTTP 429 (rate limit)** responses: a 429 puts the
 candidate into cooldown for that window and fails over to the next candidate.
-Any other error (5xx, timeout, connection) is **retried up to 3 times** on the
-same candidate before failing over, without cooldown — so a transiently
-failing candidate is tried again on the next request.
+Other errors are classified by whether a retry can help:
+
+- **5xx, timeout, connection** (transient) — **retried up to 3 times** on the
+  same candidate before failing over, without cooldown, so a transiently
+  failing candidate is tried again on the next request.
+- **4xx** (e.g. 400 invalid request, 401, 403) — **permanent, never retried**;
+  the request fails over to the next candidate immediately.
+
+### Reasoning-content echo and sessions
+
+Thinking-mode upstreams (e.g. DeepSeek) require `reasoning_content` to be
+passed back on the assistant `tool_calls` message of the next turn. The router
+captures it from upstream responses and re-injects it automatically. The cache
+is isolated **per session**: send an `X-Session-ID` header on chat requests so
+concurrent conversations never share reasoning. Clients that omit the header
+share a single global bucket, which is still safe because upstream tool-call
+IDs are globally unique.
+
+Set `REASONING_CACHE_FILE` to a path to persist the cache to disk (atomic
+write) so it survives router restarts — otherwise the cache is in-memory only
+and lost on restart, which causes thinking-mode upstreams to reject follow-up
+turns that reference prior tool calls (DeepSeek 400
+"reasoning_content must be passed back").
+
+Diagnostics: set `LOG_LEVEL=debug` to see
+`reasoning cached` and `reasoning echo` lines reporting the session, tool-call
+ID, and whether the echo lookup found a value — useful for confirming whether
+reasoning was captured and re-injected.
 
 ## Environment Variables
 
@@ -136,6 +161,8 @@ failing candidate is tried again on the next request.
 | `GEMINI_API_KEY`   | Gemini provider key (referenced in config)      | —           |
 | `ROUTER_ADDR`      | Optional override for the listen address        | config `server.host`/`server.port` |
 | `ROUTER_CONFIG`    | Path to the YAML config file                    | `config.yaml` |
+| `REASONING_CACHE_FILE` | Path to persist the reasoning-content echo cache | in-memory only |
+| `LOG_LEVEL`        | `debug`/`info`/`warn`/`error` (unset = info)      | `info` |
 
 `server.client_key` is a config-file key (not an env var): an optional static
 client key; empty disables auth.

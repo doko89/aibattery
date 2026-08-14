@@ -351,7 +351,7 @@ func (p *geminiProvider) Complete(ctx context.Context, req chat.ChatRequest) (ch
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return chat.ChatResponse{}, &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
 		}
-		return chat.ChatResponse{}, fmt.Errorf("gemini: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return chat.ChatResponse{}, &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
 	}
 
 	var gr geminiResponse
@@ -423,7 +423,7 @@ func (p *geminiProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
 		}
-		return fmt.Errorf("gemini: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
 	}
 
 	delivered := false

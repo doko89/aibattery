@@ -210,6 +210,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	virtualModel := cReq.Model
+	session := sessionKey(r)
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -224,8 +225,8 @@ func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel r
 			sel.RecordFailure(cand)
 			continue
 		}
-		s.rememberReasoning(&resp)
-		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+		s.rememberReasoning(session, &resp)
+		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
 		if err != nil {
 			s.deps.Logger.Warn("provider completion failed during tool loop",
 				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)

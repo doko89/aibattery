@@ -593,5 +593,5 @@ func (p *anthropicProvider) statusError(resp *http.Response) error {
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: msg}
 	}
-	return fmt.Errorf("anthropic: %s: %s", resp.Status, msg)
+	return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: msg}
 }

@@ -258,7 +258,7 @@ func (p *openAIProvider) Complete(ctx context.Context, req chat.ChatRequest) (ch
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return chat.ChatResponse{}, &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 		}
-		return chat.ChatResponse{}, fmt.Errorf("provider openai: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return chat.ChatResponse{}, &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 	}
 
 	var parsed openAIResponse
@@ -362,7 +362,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 		}
-		return fmt.Errorf("provider openai: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 	}
 
 	emitted := false

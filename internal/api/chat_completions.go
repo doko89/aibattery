@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +50,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cReq, err := buildChatRequest(req)
+	cReq, err := s.buildChatRequest(req, sessionKey(r))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error", "")
 		return
@@ -79,7 +80,7 @@ func validReasoningEffort(v string) bool {
 // chat.ChatRequest. System-role messages are concatenated into the System
 // field; the virtual model name is preserved as the initial Model value (the
 // orchestration loop overwrites it with each concrete candidate model).
-func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
+func (s *Server) buildChatRequest(req chatCompletionRequest, session string) (chat.ChatRequest, error) {
 	var system []string
 	var messages []chat.Message
 	for _, m := range req.Messages {
@@ -107,7 +108,10 @@ func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 		// calls, keyed by the first call's ID, or thinking-mode upstreams reject
 		// the turn (DeepSeek 400 "reasoning_content must be passed back").
 		if m.Role == "assistant" && len(msg.ToolCalls) > 0 && msg.ReasoningContent == "" {
-			msg.ReasoningContent = reasoningByCallID.lookup(msg.ToolCalls[0].ID)
+			id := msg.ToolCalls[0].ID
+			msg.ReasoningContent = reasoningByCallID.lookup(session, id)
+			s.deps.Logger.Debug("reasoning echo",
+				"session", session, "call_id", id, "found", msg.ReasoningContent != "")
 		}
 		messages = append(messages, msg)
 	}
@@ -203,47 +207,108 @@ const maxServerToolIterations = 5
 // cooldown + failover.
 const maxAttempts = 3
 
-// reasoningCache remembers reasoning_content per tool_call_id so
-// thinking-mode upstreams get it echoed on the next client turn.
-// ponytail: single-instance in-memory map, cap 4096, reset when full;
+// reasoningCache remembers reasoning_content per (session, tool_call_id) so
+// thinking-mode upstreams get it echoed on the next client turn. Entries are
+// keyed by session first so concurrent conversations never leak each other's
+// reasoning; tool_call_id then disambiguates within a session. When path is
+// set the cache is persisted to disk (atomic write) so it survives restarts;
 // a TTL/eviction policy only matters at multi-instance scale.
 type reasoningCache struct {
-	mu sync.Mutex
-	m  map[string]string
+	mu   sync.Mutex
+	path string
+	m    map[string]map[string]string
 }
 
-var reasoningByCallID = &reasoningCache{m: make(map[string]string)}
+// newReasoningCache returns a cache optionally backed by the file at path
+// (empty path = in-memory only). Existing entries are loaded on construction.
+func newReasoningCache(path string) *reasoningCache {
+	c := &reasoningCache{path: path, m: make(map[string]map[string]string)}
+	if path == "" {
+		return c
+	}
+	b, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(b, &c.m)
+	}
+	return c
+}
 
-func (c *reasoningCache) remember(calls []chat.ToolCall, reasoning string) {
+// maxReasoningEntries caps total cached entries; the cache resets when full to
+// bound memory and disk growth.
+const maxReasoningEntries = 4096
+
+// save persists the cache to path with an atomic write (temp file + rename).
+// The caller must hold mu.
+func (c *reasoningCache) save() {
+	if c.path == "" {
+		return
+	}
+	b, err := json.Marshal(c.m)
+	if err != nil {
+		return
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, c.path)
+}
+
+var reasoningByCallID = newReasoningCache("")
+
+func (c *reasoningCache) remember(session string, calls []chat.ToolCall, reasoning string) {
 	if reasoning == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.m) >= 4096 {
-		c.m = make(map[string]string)
+	total := 0
+	per, ok := c.m[session]
+	if !ok {
+		per = make(map[string]string)
+		c.m[session] = per
 	}
 	for _, tc := range calls {
 		if tc.ID != "" {
-			c.m[tc.ID] = reasoning
+			per[tc.ID] = reasoning
 		}
 	}
+	for _, s := range c.m {
+		total += len(s)
+	}
+	if total > maxReasoningEntries {
+		c.m = make(map[string]map[string]string)
+		c.m[session] = per
+	}
+	c.save()
 }
 
-func (c *reasoningCache) lookup(callID string) string {
+func (c *reasoningCache) lookup(session, callID string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.m[callID]
+	if per, ok := c.m[session]; ok {
+		return per[callID]
+	}
+	return ""
 }
 
-// rememberReasoning caches a response's reasoning_content keyed by the IDs of
-// the tool calls it produced, so a later turn (client-driven or the internal
-// tool loop) can echo it back to thinking-mode upstreams.
-func (s *Server) rememberReasoning(resp *chat.ChatResponse) {
+// sessionKey extracts the caller's conversation identifier used to isolate the
+// reasoning cache per session. An empty key means the global bucket — safe
+// because upstream tool_call IDs are globally unique.
+func sessionKey(r *http.Request) string {
+	return r.Header.Get("X-Session-ID")
+}
+
+// rememberReasoning caches a response's reasoning_content keyed by session and
+// the IDs of the tool calls it produced, so a later turn (client-driven or the
+// internal tool loop) can echo it back to thinking-mode upstreams.
+func (s *Server) rememberReasoning(session string, resp *chat.ChatResponse) {
 	if resp == nil || resp.ReasoningContent == "" {
 		return
 	}
-	reasoningByCallID.remember(resp.ToolCalls, resp.ReasoningContent)
+	reasoningByCallID.remember(session, resp.ToolCalls, resp.ReasoningContent)
+	s.deps.Logger.Debug("reasoning cached",
+		"session", session, "calls", len(resp.ToolCalls), "len", len(resp.ReasoningContent))
 }
 
 // executeServerTools runs the internal tool-execution loop for a completed
@@ -253,7 +318,7 @@ func (s *Server) rememberReasoning(resp *chat.ChatResponse) {
 // again with the extended conversation. It returns the first response that is
 // not all server-owned (client-owned or mixed batches pass through to the
 // client untouched), or resp unchanged when the iteration cap is exhausted.
-func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *chat.ChatRequest, resp *chat.ChatResponse, clientToolNames map[string]bool) (*chat.ChatResponse, error) {
+func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *chat.ChatRequest, resp *chat.ChatResponse, clientToolNames map[string]bool, session string) (*chat.ChatResponse, error) {
 	for i := 0; i < maxServerToolIterations; i++ {
 		if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
 			return resp, nil
@@ -277,9 +342,9 @@ func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *
 			return nil, err
 		}
 		resp = &next
-		s.rememberReasoning(resp)
+		s.rememberReasoning(session, resp)
 	}
-	s.rememberReasoning(resp)
+	s.rememberReasoning(session, resp)
 	return resp, nil
 }
 
@@ -310,6 +375,7 @@ func responseFromDeltas(deltas []chat.StreamDelta) chat.ChatResponse {
 func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	virtualModel := cReq.Model
+	session := sessionKey(r)
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -326,8 +392,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Se
 				sel.RecordFailure(cand)
 				continue
 			}
-			// Non-429: retry the same candidate up to maxAttempts total tries
-			// before failing over. No cooldown — it may recover quickly.
+			// 4xx (permanent, e.g. invalid request) fails over immediately:
+			// retrying a 400/401/403/404 can never succeed.
+			if !chat.IsRetryable(err) {
+				s.deps.Logger.Warn("provider completion failed (permanent)",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+				continue
+			}
+			// Transient (5xx, timeout, connection): retry the same candidate up
+			// to maxAttempts total tries before failing over. No cooldown.
 			for attempt := 1; attempt < maxAttempts; attempt++ {
 				s.deps.Logger.Warn("provider completion failed, retrying",
 					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", err)
@@ -342,8 +415,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Se
 				continue
 			}
 		}
-		s.rememberReasoning(&resp)
-		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+		s.rememberReasoning(session, &resp)
+		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
 		if err != nil {
 			s.deps.Logger.Warn("provider completion failed during tool loop",
 				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
@@ -416,6 +489,7 @@ func toRespToolCalls(tcs []chat.ToolCall) []respToolCall {
 func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	virtualModel := cReq.Model
+	session := sessionKey(r)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -462,7 +536,14 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 				sel.RecordFailure(cand)
 				continue
 			}
-			// Non-429 pre-content failure: retry the same candidate up to
+			// 4xx (permanent) fails over immediately — retrying can never
+			// succeed; only 5xx/timeout/connection (transient) is retried.
+			if !chat.IsRetryable(streamErr) {
+				s.deps.Logger.Warn("provider stream failed before content (permanent)",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
+				continue
+			}
+			// Transient pre-content failure: retry the same candidate up to
 			// maxAttempts total tries before failing over.
 			for attempt := 1; attempt < maxAttempts && streamErr != nil && !delivered; attempt++ {
 				s.deps.Logger.Warn("provider stream failed before content, retrying",
@@ -503,9 +584,9 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 			// internally instead of being forwarded.
 			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
 			resp := responseFromDeltas(deltas)
-			s.rememberReasoning(&resp)
+			s.rememberReasoning(session, &resp)
 			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
-				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
 				if err != nil {
 					s.deps.Logger.Warn("provider completion failed during tool loop",
 						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)

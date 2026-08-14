@@ -24,6 +24,9 @@ type Deps struct {
 	// ClientKey optionally requires every request (except GET /health) to
 	// carry `Authorization: Bearer <ClientKey>`. Empty string disables auth.
 	ClientKey string
+	// ReasoningCachePath optionally persists the reasoning_content echo cache
+	// to this file so it survives restarts. Empty string keeps it in-memory.
+	ReasoningCachePath string
 }
 
 // Server holds the resolved dependencies for the HTTP handlers.
@@ -38,6 +41,9 @@ func NewServer(deps Deps) http.Handler {
 		deps.Logger = slog.Default()
 	}
 	s := &Server{deps: deps}
+	if deps.ReasoningCachePath != "" {
+		reasoningByCallID = newReasoningCache(deps.ReasoningCachePath)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)

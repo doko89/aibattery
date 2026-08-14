@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -351,6 +352,126 @@ func TestNonRateLimit_FailsAllRetriesThenFailoverNoCooldown(t *testing.T) {
 	}
 	if p1Calls != maxAttempts*2 {
 		t.Errorf("p1 calls after second request = %d, want %d (tried again, no cooldown)", p1Calls, maxAttempts*2)
+	}
+}
+
+// TestPermanent4xx_NoRetryFailsOverImmediately verifies that a 4xx error (e.g.
+// 400 invalid request) is NOT retried — it fails over to the next candidate on
+// the first try, so the candidate is hit exactly once.
+func TestPermanent4xx_NoRetryFailsOverImmediately(t *testing.T) {
+	var p1Calls int
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			p1Calls++
+			return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusBadRequest, Message: "invalid request"}
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if p1Calls != 1 {
+		t.Errorf("p1 calls = %d, want 1 (4xx must not be retried)", p1Calls)
+	}
+	var out chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Model != "m2" || out.Choices[0].Message.Content != "from p2" {
+		t.Errorf("response = %q from %q, want p2", out.Choices[0].Message.Content, out.Model)
+	}
+}
+
+// TestTransient5xx_Retries3x verifies a 5xx status is treated as transient and
+// retried up to maxAttempts on the same candidate before failing over.
+func TestTransient5xx_Retries3x(t *testing.T) {
+	var p1Calls int
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			p1Calls++
+			return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusInternalServerError, Message: "boom"}
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if p1Calls != maxAttempts {
+		t.Errorf("p1 calls = %d, want %d (5xx retried 3x)", p1Calls, maxAttempts)
+	}
+}
+
+// TestReasoningCache_IsolatedPerSession verifies reasoning cached under one
+// session key is not visible to another session (no cross-session leak).
+func TestReasoningCache_IsolatedPerSession(t *testing.T) {
+	reasoningByCallID.mu.Lock()
+	delete(reasoningByCallID.m, "sess-A")
+	delete(reasoningByCallID.m, "sess-B")
+	reasoningByCallID.mu.Unlock()
+	t.Cleanup(func() {
+		reasoningByCallID.mu.Lock()
+		delete(reasoningByCallID.m, "sess-A")
+		delete(reasoningByCallID.m, "sess-B")
+		reasoningByCallID.mu.Unlock()
+	})
+
+	reasoningByCallID.remember("sess-A", []chat.ToolCall{{ID: "call_1"}}, "thinking for A")
+	if got := reasoningByCallID.lookup("sess-B", "call_1"); got != "" {
+		t.Errorf("lookup in sess-B = %q, want empty (session isolation)", got)
+	}
+	if got := reasoningByCallID.lookup("sess-A", "call_1"); got != "thinking for A" {
+		t.Errorf("lookup in sess-A = %q, want thinking for A", got)
+	}
+}
+
+// TestReasoningCache_PersistsToDisk verifies a disk-backed cache round-trips
+// through a file: an entry stored in one instance is found by a fresh instance
+// constructed from the same path (simulating a router restart).
+func TestReasoningCache_PersistsToDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reasoning_cache.json")
+
+	c1 := newReasoningCache(path)
+	c1.remember("sess-X", []chat.ToolCall{{ID: "call_9"}}, "persisted thinking")
+
+	c2 := newReasoningCache(path)
+	if got := c2.lookup("sess-X", "call_9"); got != "persisted thinking" {
+		t.Errorf("fresh instance lookup = %q, want persisted thinking", got)
 	}
 }
 
@@ -1324,9 +1445,10 @@ func TestChatCompletions_StreamServerTool(t *testing.T) {
 }
 
 // seedReasoning stores a cached reasoning value so a test can simulate a prior
-// upstream turn that produced reasoning_content for a tool call.
+// upstream turn that produced reasoning_content for a tool call. Tests use the
+// global bucket (no X-Session-ID header) via doJSON.
 func seedReasoning(id, text string) {
-	reasoningByCallID.remember([]chat.ToolCall{{ID: id}}, text)
+	reasoningByCallID.remember("", []chat.ToolCall{{ID: id}}, text)
 }
 
 func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
@@ -1334,7 +1456,7 @@ func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
 	seedReasoning("call_1", "prior thinking")
 	t.Cleanup(func() {
 		reasoningByCallID.mu.Lock()
-		delete(reasoningByCallID.m, "call_1")
+		delete(reasoningByCallID.m[""], "call_1")
 		reasoningByCallID.mu.Unlock()
 	})
 

@@ -214,6 +214,7 @@ func (a *anthropicSSEWriter) writeResponseBurst(resp chat.ChatResponse) error {
 func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	virtualModel := cReq.Model
+	session := sessionKey(r)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -274,9 +275,9 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 			// internally instead of being forwarded.
 			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
 			resp := responseFromDeltas(deltas)
-			s.rememberReasoning(&resp)
+			s.rememberReasoning(session, &resp)
 			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
-				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
 				if err != nil {
 					s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
 						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
