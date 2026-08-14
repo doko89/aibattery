@@ -106,12 +106,20 @@ func (s *Server) buildChatRequest(req chatCompletionRequest, session string) (ch
 		// Clients (OpenCode/OpenAI SDKs) never send reasoning_content back; echo
 		// the value captured from the upstream response that produced these tool
 		// calls, keyed by the first call's ID, or thinking-mode upstreams reject
-		// the turn (DeepSeek 400 "reasoning_content must be passed back").
+		// the turn (DeepSeek 400 "reasoning_content must be passed back"). When
+		// the cache has nothing (calls produced by a non-thinking provider, e.g.
+		// GLM without thinking enabled), a placeholder keeps the turn routable.
 		if m.Role == "assistant" && len(msg.ToolCalls) > 0 && msg.ReasoningContent == "" {
 			id := msg.ToolCalls[0].ID
-			msg.ReasoningContent = reasoningByCallID.lookup(session, id)
-			s.deps.Logger.Debug("reasoning echo",
-				"session", session, "call_id", id, "found", msg.ReasoningContent != "")
+			if r := reasoningByCallID.lookup(session, id); r != "" {
+				msg.ReasoningContent = r
+				s.deps.Logger.Debug("reasoning echo",
+					"session", session, "call_id", id, "found", true)
+			} else {
+				msg.ReasoningContent = reasoningPlaceholder
+				s.deps.Logger.Debug("reasoning echo",
+					"session", session, "call_id", id, "found", false, "injected", true)
+			}
 		}
 		messages = append(messages, msg)
 	}
@@ -206,6 +214,15 @@ const maxServerToolIterations = 5
 // errors before failing over. 429 is never retried — it goes straight to
 // cooldown + failover.
 const maxAttempts = 3
+
+// reasoningPlaceholder is injected as the assistant message's reasoning_content
+// when a tool-call turn arrives with no captured reasoning and the client sent
+// none. Thinking-mode upstreams (DeepSeek reasoner, GLM thinking) hard-reject
+// tool-call turns that omit reasoning_content (400 "must be passed back"), so a
+// minimal non-empty marker keeps the turn routable across a failover chain that
+// mixes thinking and non-thinking providers. It is never cached as real
+// reasoning, only placed on the wire for the current request.
+const reasoningPlaceholder = "[reasoning omitted by client]"
 
 // reasoningCache remembers reasoning_content per (session, tool_call_id) so
 // thinking-mode upstreams get it echoed on the next client turn. Entries are
@@ -304,6 +321,13 @@ func sessionKey(r *http.Request) string {
 // internal tool loop) can echo it back to thinking-mode upstreams.
 func (s *Server) rememberReasoning(session string, resp *chat.ChatResponse) {
 	if resp == nil || resp.ReasoningContent == "" {
+		// A served response with tool calls but no reasoning means the
+		// producing provider is not in thinking mode; the echo cache stays
+		// empty for those call IDs and the placeholder path will cover them.
+		if resp != nil && len(resp.ToolCalls) > 0 {
+			s.deps.Logger.Debug("no reasoning to cache",
+				"session", session, "calls", len(resp.ToolCalls))
+		}
 		return
 	}
 	reasoningByCallID.remember(session, resp.ToolCalls, resp.ReasoningContent)

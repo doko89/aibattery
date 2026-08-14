@@ -1502,6 +1502,47 @@ func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
 	}
 }
 
+// TestChatCompletions_ReasoningEchoMissInjectsPlaceholder verifies that a
+// tool-call turn with no cached reasoning (e.g. the calls were produced by a
+// non-thinking provider like GLM without thinking enabled) still reaches the
+// upstream with a non-empty reasoning_content, so thinking-mode candidates in
+// a failover chain accept the turn instead of 400ing.
+func TestChatCompletions_ReasoningEchoMissInjectsPlaceholder(t *testing.T) {
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "virtual-a",
+		"messages": []map[string]any{
+			{"role": "user", "content": "what's the weather"},
+			{"role": "assistant", "content": "", "tool_calls": []map[string]any{
+				{"id": "call_unknown", "type": "function", "function": map[string]string{"name": "search_web", "arguments": `{"query":"weather"}`}},
+			}},
+			{"role": "tool", "tool_call_id": "call_unknown", "content": "sunny"},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got.Messages[1].ReasoningContent != reasoningPlaceholder {
+		t.Errorf("Messages[1].ReasoningContent = %q, want placeholder %q", got.Messages[1].ReasoningContent, reasoningPlaceholder)
+	}
+	// The placeholder must never be cached as real reasoning.
+	if got := reasoningByCallID.lookup("", "call_unknown"); got != "" {
+		t.Errorf("placeholder leaked into cache: lookup = %q, want empty", got)
+	}
+}
+
 func TestChatCompletions_ServerToolEchoesReasoning(t *testing.T) {
 	tr := toolkit.New()
 	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {

@@ -147,10 +147,18 @@ and lost on restart, which causes thinking-mode upstreams to reject follow-up
 turns that reference prior tool calls (DeepSeek 400
 "reasoning_content must be passed back").
 
+When a client echoes tool calls back with no reasoning and the cache has none
+(calls produced by a non-thinking provider, e.g. GLM without thinking
+enabled), the router injects a non-empty placeholder
+(`[reasoning omitted by client]`) as `reasoning_content` so thinking-mode
+candidates in the failover chain accept the turn instead of 400ing. The
+placeholder is only placed on the wire for the current request — it is never
+cached as real reasoning.
+
 Diagnostics: set `LOG_LEVEL=debug` to see
-`reasoning cached` and `reasoning echo` lines reporting the session, tool-call
-ID, and whether the echo lookup found a value — useful for confirming whether
-reasoning was captured and re-injected.
+`reasoning cached`, `no reasoning to cache`, and `reasoning echo` lines
+reporting the session, tool-call ID, and whether the echo lookup found a
+value — useful for confirming whether reasoning was captured and re-injected.
 
 ## Environment Variables
 
