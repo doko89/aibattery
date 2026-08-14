@@ -47,7 +47,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cReq := buildChatRequest(req)
+	cReq, err := buildChatRequest(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error", "")
+		return
+	}
 	if s.deps.Tools != nil {
 		cReq.Tools = s.deps.Tools.List()
 	}
@@ -72,15 +76,19 @@ func validReasoningEffort(v string) bool {
 // chat.ChatRequest. System-role messages are concatenated into the System
 // field; the virtual model name is preserved as the initial Model value (the
 // orchestration loop overwrites it with each concrete candidate model).
-func buildChatRequest(req chatCompletionRequest) chat.ChatRequest {
+func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 	var system []string
 	var messages []chat.Message
 	for _, m := range req.Messages {
+		content, err := anthropicContentText(m.Content)
+		if err != nil {
+			return chat.ChatRequest{}, err
+		}
 		if m.Role == "system" {
-			system = append(system, m.Content)
+			system = append(system, content)
 			continue
 		}
-		messages = append(messages, chat.Message{Role: chat.Role(m.Role), Content: m.Content})
+		messages = append(messages, chat.Message{Role: chat.Role(m.Role), Content: content})
 	}
 
 	var maxTokens *int
@@ -97,7 +105,7 @@ func buildChatRequest(req chatCompletionRequest) chat.ChatRequest {
 		MaxTokens:       maxTokens,
 		ReasoningEffort: req.ReasoningEffort,
 		Stream:          req.Stream,
-	}
+	}, nil
 }
 
 // complete runs the non-streaming failover loop. It iterates the selector's

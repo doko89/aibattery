@@ -129,6 +129,34 @@ func TestNonStreamSuccess(t *testing.T) {
 	}
 }
 
+func TestChatCompletions_ContentArray(t *testing.T) {
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			if len(req.Messages) != 1 {
+				t.Errorf("Messages len = %d, want 1", len(req.Messages))
+			} else if got := req.Messages[0].Content; got != "hello" {
+				t.Errorf("Content = %q, want hello", got)
+			}
+			return chat.ChatResponse{Content: "world", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "virtual-a",
+		"messages": []map[string]any{
+			{"role": "user", "content": []map[string]string{{"type": "text", "text": "hello"}}},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestFailoverToSecondCandidate(t *testing.T) {
 	p1 := &fakeProvider{
 		name: "p1",
