@@ -1,0 +1,8 @@
+anthropic-api.md
+gemini-api.md
+openai-compatible-api.md
+config.yaml
+.codegraph
+.omo/
+*.swp
+ai-router

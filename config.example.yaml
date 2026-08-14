@@ -1,0 +1,68 @@
+# AI Router example configuration.
+#
+# Copy to config.yaml and fill in the environment variables. ${ENV_VAR}
+# expansion happens ONLY in provider api_key and MCP bearer_token/url fields;
+# everywhere else values are used literally.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # Optional static client key; when set, all requests except GET /health
+  # require "Authorization: Bearer <client_key>". Empty disables auth.
+  # Note: this value is NOT ${ENV_VAR}-expanded — put a literal key here.
+  client_key: "sk-replace-me-with-a-literal-key"
+
+# Optional MCP servers (tool providers) the MCP client may attach to.
+# bearer_token and url support ${ENV_VAR} expansion. A server that fails to
+# connect at startup is skipped (logged) rather than failing the app.
+mcp:
+  servers:
+    - name: tools
+      transport: streamable
+      url: http://127.0.0.1:18091/mcp
+      bearer_token: ${MCP_SERVER_TOKEN}
+      # timeout: "30s"
+
+# Upstream providers. api_key supports ${ENV_VAR} expansion; a missing or
+# empty variable expands to "" (the router still loads).
+providers:
+  - name: oc-go
+    type: openai
+    base_url: https://opencode.ai/zen/go/v1
+    api_key: ${OPENCODE_GO_KEY}
+
+  - name: oc-free
+    type: openai
+    base_url: https://opencode.ai/zen/v1
+    # No api_key — this endpoint is keyless.
+
+  - name: ds
+    type: openai
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+
+  - name: zai
+    type: openai
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key: ${ZAI_API_KEY}
+
+# Virtual models exposed to clients. strategy is "failover" or "round_robin";
+# candidates are tried in config order.
+models:
+  - name: flash
+    strategy: round_robin
+    candidates:
+      - provider: oc-free
+        model: deepseek-v4-flash-free
+      - provider: oc-go
+        model: deepseek-v4-flash
+
+  - name: pro
+    strategy: round_robin
+    candidates:
+      - provider: ds
+        model: deepseek-v4-pro
+      - provider: oc-go
+        model: deepseek-v4-pro
+      - provider: zai
+        model: glm-5.2
