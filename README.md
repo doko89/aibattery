@@ -100,6 +100,7 @@ providers:
 models:
   - name: lite
     strategy: failover
+    cooldown: "30s"
     candidates:
       - provider: openai
         model: gpt-4o-mini
@@ -118,6 +119,13 @@ models:
       - provider: gemini
         model: glm-4.7
 ```
+
+`cooldown` is an optional per-model failure-cooldown window (default `30s`).
+It applies **only to HTTP 429 (rate limit)** responses: a 429 puts the
+candidate into cooldown for that window and fails over to the next candidate.
+Any other error (5xx, timeout, connection) is **retried up to 3 times** on the
+same candidate before failing over, without cooldown — so a transiently
+failing candidate is tried again on the next request.
 
 ## Environment Variables
 

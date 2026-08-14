@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aibattery/router/internal/chat"
@@ -101,6 +102,13 @@ func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 				msg.ToolCalls = append(msg.ToolCalls, call)
 			}
 		}
+		// Clients (OpenCode/OpenAI SDKs) never send reasoning_content back; echo
+		// the value captured from the upstream response that produced these tool
+		// calls, keyed by the first call's ID, or thinking-mode upstreams reject
+		// the turn (DeepSeek 400 "reasoning_content must be passed back").
+		if m.Role == "assistant" && len(msg.ToolCalls) > 0 && msg.ReasoningContent == "" {
+			msg.ReasoningContent = reasoningByCallID.lookup(msg.ToolCalls[0].ID)
+		}
 		messages = append(messages, msg)
 	}
 
@@ -190,6 +198,54 @@ func (s *Server) allServerToolCalls(calls []chat.ToolCall, clientToolNames map[s
 // ponytail: hard cap 5, raise if models need longer tool chains
 const maxServerToolIterations = 5
 
+// maxAttempts is how many times a candidate is tried in total for non-429
+// errors before failing over. 429 is never retried — it goes straight to
+// cooldown + failover.
+const maxAttempts = 3
+
+// reasoningCache remembers reasoning_content per tool_call_id so
+// thinking-mode upstreams get it echoed on the next client turn.
+// ponytail: single-instance in-memory map, cap 4096, reset when full;
+// a TTL/eviction policy only matters at multi-instance scale.
+type reasoningCache struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+var reasoningByCallID = &reasoningCache{m: make(map[string]string)}
+
+func (c *reasoningCache) remember(calls []chat.ToolCall, reasoning string) {
+	if reasoning == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.m) >= 4096 {
+		c.m = make(map[string]string)
+	}
+	for _, tc := range calls {
+		if tc.ID != "" {
+			c.m[tc.ID] = reasoning
+		}
+	}
+}
+
+func (c *reasoningCache) lookup(callID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[callID]
+}
+
+// rememberReasoning caches a response's reasoning_content keyed by the IDs of
+// the tool calls it produced, so a later turn (client-driven or the internal
+// tool loop) can echo it back to thinking-mode upstreams.
+func (s *Server) rememberReasoning(resp *chat.ChatResponse) {
+	if resp == nil || resp.ReasoningContent == "" {
+		return
+	}
+	reasoningByCallID.remember(resp.ToolCalls, resp.ReasoningContent)
+}
+
 // executeServerTools runs the internal tool-execution loop for a completed
 // response. When every tool call is server-owned, each call is executed
 // against the tool registry and the request extended with the assistant
@@ -208,7 +264,7 @@ func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *
 				out = err.Error()
 			}
 			cReq.Messages = append(cReq.Messages,
-				chat.Message{Role: chat.RoleAssistant, ToolCalls: []chat.ToolCall{tc}},
+				chat.Message{Role: chat.RoleAssistant, ReasoningContent: resp.ReasoningContent, ToolCalls: []chat.ToolCall{tc}},
 				chat.Message{Role: chat.RoleTool, ToolCallID: tc.ID, Content: out},
 			)
 		}
@@ -221,7 +277,9 @@ func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *
 			return nil, err
 		}
 		resp = &next
+		s.rememberReasoning(resp)
 	}
+	s.rememberReasoning(resp)
 	return resp, nil
 }
 
@@ -235,6 +293,7 @@ func responseFromDeltas(deltas []chat.StreamDelta) chat.ChatResponse {
 		if d.FinishReason != "" {
 			resp.FinishReason = d.FinishReason
 			resp.ToolCalls = d.ToolCalls
+			resp.ReasoningContent = d.ReasoningContent
 			if d.Usage != nil {
 				resp.Usage = *d.Usage
 			}
@@ -250,6 +309,7 @@ func responseFromDeltas(deltas []chat.StreamDelta) chat.ChatResponse {
 // responds 502.
 func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
+	virtualModel := cReq.Model
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -259,19 +319,42 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Se
 		}
 		resp, err := p.Complete(ctx, cReq)
 		if err != nil {
-			s.deps.Logger.Warn("provider completion failed",
-				"provider", cand.ProviderName, "model", cand.Model, "error", err)
-			sel.RecordFailure(cand)
-			continue
+			// 429 is never retried: it goes straight to cooldown + failover.
+			if chat.IsRateLimit(err) {
+				s.deps.Logger.Warn("provider rate limited",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+				sel.RecordFailure(cand)
+				continue
+			}
+			// Non-429: retry the same candidate up to maxAttempts total tries
+			// before failing over. No cooldown — it may recover quickly.
+			for attempt := 1; attempt < maxAttempts; attempt++ {
+				s.deps.Logger.Warn("provider completion failed, retrying",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", err)
+				resp, err = p.Complete(ctx, cReq)
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				s.deps.Logger.Warn("provider completion failed after retries",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+				continue
+			}
 		}
+		s.rememberReasoning(&resp)
 		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
 		if err != nil {
 			s.deps.Logger.Warn("provider completion failed during tool loop",
-				"provider", cand.ProviderName, "model", cand.Model, "error", err)
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 			sel.RecordFailure(cand)
 			continue
 		}
 		sel.RecordSuccess(cand)
+		s.deps.Logger.Info("completion served",
+			"virtual_model", virtualModel,
+			"provider", cand.ProviderName,
+			"model", cand.Model)
 		writeCompletion(w, cand.Model, *final)
 		return
 	}
@@ -332,6 +415,7 @@ func toRespToolCalls(tcs []chat.ToolCall) []respToolCall {
 // forwarded to a client that cannot run them.
 func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
+	virtualModel := cReq.Model
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -349,6 +433,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 		return
 	}
 
+	succeeded := false
 	for _, cand := range candidates {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -370,17 +455,47 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 		})
 
 		if streamErr != nil && !delivered {
-			s.deps.Logger.Warn("provider stream failed before content",
-				"provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
-			sel.RecordFailure(cand)
-			continue
+			// 429 is never retried: straight to cooldown + failover.
+			if chat.IsRateLimit(streamErr) {
+				s.deps.Logger.Warn("provider stream rate limited",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
+				sel.RecordFailure(cand)
+				continue
+			}
+			// Non-429 pre-content failure: retry the same candidate up to
+			// maxAttempts total tries before failing over.
+			for attempt := 1; attempt < maxAttempts && streamErr != nil && !delivered; attempt++ {
+				s.deps.Logger.Warn("provider stream failed before content, retrying",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", streamErr)
+				delivered = false
+				endedInError = false
+				deltas = nil
+				streamErr = p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
+					delivered = true
+					if d.FinishReason == "error" {
+						endedInError = true
+					}
+					deltas = append(deltas, d)
+					return nil
+				})
+			}
+			if streamErr != nil && !delivered {
+				s.deps.Logger.Warn("provider stream failed before content after retries",
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
+				continue
+			}
 		}
 
-		if endedInError {
-			sel.RecordFailure(cand)
-		} else {
+		if !endedInError {
 			sel.RecordSuccess(cand)
 		}
+		// A candidate delivered content (or errored after content): the stream
+		// is final and cannot be failed over, so the loop must not continue.
+		succeeded = true
+		s.deps.Logger.Info("stream served",
+			"virtual_model", virtualModel,
+			"provider", cand.ProviderName,
+			"model", cand.Model)
 
 		if streamErr == nil && !endedInError {
 			// The stream completed cleanly: the buffered final chunk decides
@@ -388,15 +503,16 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 			// internally instead of being forwarded.
 			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
 			resp := responseFromDeltas(deltas)
+			s.rememberReasoning(&resp)
 			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
 				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
 				if err != nil {
 					s.deps.Logger.Warn("provider completion failed during tool loop",
-						"provider", cand.ProviderName, "model", cand.Model, "error", err)
+						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 					_ = sw.writeError("tool execution failed: " + err.Error())
 				} else if err := sw.writeResponseBurst(cand.Model, *final); err != nil {
 					s.deps.Logger.Warn("stream write failed",
-						"provider", cand.ProviderName, "error", err)
+						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 				}
 				break
 			}
@@ -407,12 +523,17 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 		for _, d := range deltas {
 			if err := sw.writeChunk(cand.Model, d); err != nil {
 				s.deps.Logger.Warn("stream write failed",
-					"provider", cand.ProviderName, "error", err)
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 				break
 			}
 		}
 		break
 	}
 
+	// Every candidate failed before delivering any content: surface an error
+	// frame instead of a misleading empty 200 stream.
+	if !succeeded {
+		sw.writeError("all model candidates failed")
+	}
 	sw.writeDone()
 }

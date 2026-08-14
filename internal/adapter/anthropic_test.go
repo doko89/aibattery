@@ -121,6 +121,27 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 	}
 }
 
+func TestAnthropicComplete_RateLimit429(t *testing.T) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	})
+
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model:    "claude-sonnet-4-6",
+		Messages: []chat.Message{{Role: chat.RoleUser, Content: "Hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for 429")
+	}
+	if !chat.IsRateLimit(err) {
+		t.Fatalf("error = %v, want IsRateLimit to be true", err)
+	}
+	if !strings.Contains(err.Error(), "status 429") {
+		t.Errorf("error = %q, want to contain status 429", err)
+	}
+}
+
 func TestAnthropicComplete_Thinking(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -24,17 +24,19 @@ type geminiProvider struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+	timeout    time.Duration
 }
 
 // NewGeminiProvider returns a chat.Provider backed by the Google Gemini API.
 // baseURL is the API root (e.g. https://generativelanguage.googleapis.com) and
-// apiKey is sent via the x-goog-api-key header. timeout bounds every HTTP
-// request made by the provider.
+// apiKey is sent via the x-goog-api-key header. timeout bounds each
+// non-streaming completion; streaming uses the shared streamTimeout budget.
 func NewGeminiProvider(baseURL, apiKey string, timeout time.Duration) chat.Provider {
 	return &geminiProvider{
 		baseURL:    baseURL,
 		apiKey:     apiKey,
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: &http.Client{},
+		timeout:    timeout,
 	}
 }
 
@@ -324,6 +326,8 @@ func geminiUsage(u geminiUsageMeta) chat.Usage {
 
 // Complete performs a non-streaming completion.
 func (p *geminiProvider) Complete(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
 	body, err := buildGeminiRequest(req)
 	if err != nil {
 		return chat.ChatResponse{}, fmt.Errorf("gemini: build request: %w", err)
@@ -394,6 +398,8 @@ func (p *geminiProvider) Complete(ctx context.Context, req chat.ChatRequest) (ch
 // There is no [DONE] sentinel; a final StreamDelta carrying the finish reason
 // (and usage when present) is emitted at end of body.
 func (p *geminiProvider) Stream(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+	ctx, cancel := context.WithTimeout(ctx, streamTimeout)
+	defer cancel()
 	body, err := buildGeminiRequest(req)
 	if err != nil {
 		return fmt.Errorf("gemini: build request: %w", err)

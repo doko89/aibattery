@@ -99,6 +99,7 @@ func (s *sseWriter) writeChunk(model string, d chat.StreamDelta) error {
 // SSE burst: one content delta, then a final chunk carrying the finish reason,
 // any remaining tool calls and usage. Used to stream the result of the
 // internal server-tool execution loop, whose response was never streamed.
+// ponytail: reasoning_content is not emitted to the client; the router re-injects it from the cache on the next turn
 func (s *sseWriter) writeResponseBurst(model string, resp chat.ChatResponse) error {
 	if resp.Content != "" {
 		if err := s.writeChunk(model, chat.StreamDelta{Delta: resp.Content}); err != nil {

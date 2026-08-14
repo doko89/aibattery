@@ -23,21 +23,33 @@ type openAIProvider struct {
 	baseURL string
 	apiKey  string
 	client  *http.Client
+	timeout time.Duration
 }
 
 // NewOpenAIProvider returns a chat.Provider backed by an OpenAI-compatible
 // chat completions endpoint. baseURL should include the /v1 prefix (e.g.
 // "https://api.openai.com/v1"); the trailing "/chat/completions" is appended.
+// timeout bounds each non-streaming completion; streaming uses a fixed,
+// generous budget (streamTimeout) because reasoning models can think for
+// minutes before the first delta.
 func NewOpenAIProvider(baseURL, apiKey string, timeout time.Duration) chat.Provider {
 	return &openAIProvider{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		client:  &http.Client{Timeout: timeout},
+		client:  &http.Client{},
+		timeout: timeout,
 	}
 }
 
 // Name returns the provider identifier.
 func (p *openAIProvider) Name() string { return "openai" }
+
+// streamTimeout bounds the total time a streaming request may run. Reasoning
+// models can think for minutes before the first delta, so this is deliberately
+// generous; http.Client.Timeout cannot be used because it is a total deadline
+// that would kill healthy long streams.
+// ponytail: fixed 5m streaming budget; make configurable if providers need more
+const streamTimeout = 5 * time.Minute
 
 // ---- wire types -----------------------------------------------------------
 
@@ -94,9 +106,10 @@ type openAIToolCall struct {
 
 // openAIResponseMessage is the assistant message in a non-streaming response.
 type openAIResponseMessage struct {
-	Role      string           `json:"role"`
-	Content   string           `json:"content"`
-	ToolCalls []openAIToolCall `json:"tool_calls"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ToolCalls        []openAIToolCall `json:"tool_calls"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
 }
 
 // openAIChoice is a single choice in a non-streaming response.
@@ -125,8 +138,9 @@ type openAIStreamToolCall struct {
 
 // openAIStreamDelta is the delta object inside a streaming chunk.
 type openAIStreamDelta struct {
-	Content   string                 `json:"content"`
-	ToolCalls []openAIStreamToolCall `json:"tool_calls"`
+	Content          string                 `json:"content"`
+	ToolCalls        []openAIStreamToolCall `json:"tool_calls"`
+	ReasoningContent string                 `json:"reasoning_content,omitempty"`
 }
 
 // openAIStreamChoice is a single choice inside a streaming chunk.
@@ -220,6 +234,8 @@ func mapUsage(u openAIUsage) chat.Usage {
 
 // Complete performs a non-streaming completion and returns the parsed result.
 func (p *openAIProvider) Complete(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
 	payload, err := buildRequest(req)
 	if err != nil {
 		return chat.ChatResponse{}, fmt.Errorf("provider openai: marshal request: %w", err)
@@ -259,6 +275,7 @@ func (p *openAIProvider) Complete(ctx context.Context, req chat.ChatRequest) (ch
 		choice := parsed.Choices[0]
 		out.Content = choice.Message.Content
 		out.FinishReason = choice.FinishReason
+		out.ReasoningContent = choice.Message.ReasoningContent
 		if len(choice.Message.ToolCalls) > 0 {
 			calls := make([]chat.ToolCall, 0, len(choice.Message.ToolCalls))
 			for _, tc := range choice.Message.ToolCalls {
@@ -285,9 +302,13 @@ type toolCallAccum struct {
 }
 
 // buildToolCallDelta assembles the final StreamDelta carrying any accumulated
-// tool calls. When no calls were collected it returns a plain finish delta.
-func buildToolCallDelta(finishReason string, usage *chat.Usage, acc map[int]*toolCallAccum) chat.StreamDelta {
+// tool calls and the stream's accumulated reasoning_content. When no calls
+// were collected it returns a plain finish delta.
+func buildToolCallDelta(finishReason string, usage *chat.Usage, acc map[int]*toolCallAccum, reasoning string) chat.StreamDelta {
 	delta := chat.StreamDelta{FinishReason: finishReason, Usage: usage}
+	if reasoning != "" {
+		delta.ReasoningContent = reasoning
+	}
 	if len(acc) == 0 {
 		return delta
 	}
@@ -316,6 +337,8 @@ func buildToolCallDelta(finishReason string, usage *chat.Usage, acc map[int]*too
 // Stream performs a streaming completion, calling emit for each delta and a
 // final chunk carrying the finish reason.
 func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+	ctx, cancel := context.WithTimeout(ctx, streamTimeout)
+	defer cancel()
 	req.Stream = true
 	payload, err := buildRequest(req)
 	if err != nil {
@@ -344,6 +367,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 
 	emitted := false
 	acc := make(map[int]*toolCallAccum)
+	var reasoning strings.Builder // stream-global: DeepSeek streams reasoning before any tool-call delta
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -358,7 +382,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 		}
 		if payload == "[DONE]" {
 			if len(acc) > 0 {
-				_ = emit(buildToolCallDelta("stop", nil, acc))
+				_ = emit(buildToolCallDelta("stop", nil, acc, reasoning.String()))
 			}
 			return nil
 		}
@@ -384,6 +408,10 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 			}
 		}
 
+		if choice.Delta.ReasoningContent != "" {
+			reasoning.WriteString(choice.Delta.ReasoningContent)
+		}
+
 		for _, tc := range choice.Delta.ToolCalls {
 			a := acc[tc.Index]
 			if a == nil {
@@ -407,7 +435,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 				u := mapUsage(*chunk.Usage)
 				usage = &u
 			}
-			_ = emit(buildToolCallDelta(choice.FinishReason, usage, acc))
+			_ = emit(buildToolCallDelta(choice.FinishReason, usage, acc, reasoning.String()))
 			return nil
 		}
 	}
@@ -424,7 +452,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 	if !emitted && len(acc) == 0 {
 		return fmt.Errorf("provider openai: stream ended without content")
 	}
-	_ = emit(buildToolCallDelta("stop", nil, acc))
+	_ = emit(buildToolCallDelta("stop", nil, acc, reasoning.String()))
 	return nil
 }
 

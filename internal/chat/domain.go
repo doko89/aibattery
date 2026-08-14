@@ -76,6 +76,11 @@ type ChatResponse struct {
 	Usage        Usage
 	// ToolCalls holds the model's requested tool invocations, if any.
 	ToolCalls []ToolCall
+	// ReasoningContent is the model's chain-of-thought text (DeepSeek
+	// `reasoning_content`). Thinking-mode APIs require it to be echoed back on
+	// the assistant tool_calls message of the NEXT turn; the router captures it
+	// from responses and re-injects it per tool_call_id.
+	ReasoningContent string
 }
 
 // StreamDelta is a single chunk handed to a StreamFunc during streaming.
@@ -91,6 +96,11 @@ type StreamDelta struct {
 	// ToolCalls is populated only on the FINAL chunk (when FinishReason ==
 	// "tool_calls") if the streaming model produced tool calls; nil otherwise.
 	ToolCalls []ToolCall
+	// ReasoningContent is the model's chain-of-thought text (DeepSeek
+	// `reasoning_content`). Thinking-mode APIs require it to be echoed back on
+	// the assistant tool_calls message of the NEXT turn; the router captures it
+	// from responses and re-injects it per tool_call_id.
+	ReasoningContent string
 }
 
 // StreamFunc receives each StreamDelta produced by a streaming completion.

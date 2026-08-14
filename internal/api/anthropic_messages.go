@@ -102,6 +102,9 @@ func parseAnthropicMessageRequest(body []byte) (chat.ChatRequest, bool, error) {
 
 	var messages []chat.Message
 	for _, m := range wire.Messages {
+		// Note: assistant tool_use blocks are not parsed into canonical
+		// ToolCalls here, so the reasoning_content echo (reasoningByCallID) is
+		// a no-op on the Anthropic wire; only the OpenAI wire round-trips them.
 		content, err := anthropicContentText(m.Content)
 		if err != nil {
 			return chat.ChatRequest{}, false, err
@@ -206,6 +209,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 // internally by the router. If every candidate fails it responds 502.
 func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
+	virtualModel := cReq.Model
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -216,18 +220,23 @@ func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel r
 		resp, err := p.Complete(ctx, cReq)
 		if err != nil {
 			s.deps.Logger.Warn("provider completion failed",
-				"provider", cand.ProviderName, "model", cand.Model, "error", err)
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 			sel.RecordFailure(cand)
 			continue
 		}
+		s.rememberReasoning(&resp)
 		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
 		if err != nil {
 			s.deps.Logger.Warn("provider completion failed during tool loop",
-				"provider", cand.ProviderName, "model", cand.Model, "error", err)
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 			sel.RecordFailure(cand)
 			continue
 		}
 		sel.RecordSuccess(cand)
+		s.deps.Logger.Info("completion served",
+			"virtual_model", virtualModel,
+			"provider", cand.ProviderName,
+			"model", cand.Model)
 		writeAnthropicMessage(w, cand.Model, *final)
 		return
 	}

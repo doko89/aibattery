@@ -212,6 +212,148 @@ func TestFailoverToSecondCandidate(t *testing.T) {
 	}
 }
 
+// TestRateLimit429_FailoverWithCooldown verifies that a 429 puts the candidate
+// into cooldown (skipped on the next request) and fails over to the next
+// candidate.
+func TestRateLimit429_FailoverWithCooldown(t *testing.T) {
+	var p1Calls int
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			p1Calls++
+			return chat.ChatResponse{}, &chat.RateLimitError{Provider: "p1", StatusCode: http.StatusTooManyRequests, Message: "rate limited"}
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			if req.Model != "m2" {
+				t.Errorf("got model %q, want m2", req.Model)
+			}
+			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	body := map[string]any{"model": "virtual-a", "messages": []map[string]string{{"role": "user", "content": "hi"}}}
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if p1Calls != 1 {
+		t.Errorf("p1 calls on first request = %d, want 1", p1Calls)
+	}
+
+	// Second request: p1 is in cooldown (30s default), so p2 must be hit
+	// directly without touching p1.
+	p1Calls = 0
+	rec2 := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+	if p1Calls != 0 {
+		t.Errorf("p1 calls on second request = %d, want 0 (cooldown)", p1Calls)
+	}
+}
+
+// TestNonRateLimit_RetriesSameCandidate3x verifies that a non-429 failure is
+// retried on the same candidate up to maxAttempts before failing over.
+func TestNonRateLimit_RetriesSameCandidate3x(t *testing.T) {
+	var p1Calls int
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			p1Calls++
+			if p1Calls < 3 {
+				return chat.ChatResponse{}, errors.New("p1 transient down")
+			}
+			return chat.ChatResponse{Content: "from p1 after retries", FinishReason: "stop"}, nil
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "should not be reached", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if p1Calls != 3 {
+		t.Errorf("p1 calls = %d, want 3 (initial + 2 retries)", p1Calls)
+	}
+	var out chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Model != "m1" || out.Choices[0].Message.Content != "from p1 after retries" {
+		t.Errorf("response = %q from %q, want p1's retried response", out.Choices[0].Message.Content, out.Model)
+	}
+}
+
+// TestNonRateLimit_FailsAllRetriesThenFailoverNoCooldown verifies that a
+// persistent non-429 failure fails over after maxAttempts, and the candidate
+// is NOT cooldowned (tried again on the next request).
+func TestNonRateLimit_FailsAllRetriesThenFailoverNoCooldown(t *testing.T) {
+	var p1Calls int
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			p1Calls++
+			return chat.ChatResponse{}, errors.New("p1 down")
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	body := map[string]any{"model": "virtual-a", "messages": []map[string]string{{"role": "user", "content": "hi"}}}
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if p1Calls != maxAttempts {
+		t.Errorf("p1 calls on first request = %d, want %d (maxAttempts)", p1Calls, maxAttempts)
+	}
+
+	// No cooldown for non-429: the next request tries p1 again.
+	rec2 := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+	if p1Calls != maxAttempts*2 {
+		t.Errorf("p1 calls after second request = %d, want %d (tried again, no cooldown)", p1Calls, maxAttempts*2)
+	}
+}
+
 func TestAllCandidatesFailReturns502(t *testing.T) {
 	p1 := &fakeProvider{
 		name: "p1",
@@ -1178,5 +1320,154 @@ func TestChatCompletions_StreamServerTool(t *testing.T) {
 	}
 	if p1.requests[1].Stream {
 		t.Errorf("tool-loop continuation request Stream = %v, want false (must complete, not stream)", p1.requests[1].Stream)
+	}
+}
+
+// seedReasoning stores a cached reasoning value so a test can simulate a prior
+// upstream turn that produced reasoning_content for a tool call.
+func seedReasoning(id, text string) {
+	reasoningByCallID.remember([]chat.ToolCall{{ID: id}}, text)
+}
+
+func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
+	// Simulate a prior upstream turn: search_web call_1 produced reasoning.
+	seedReasoning("call_1", "prior thinking")
+	t.Cleanup(func() {
+		reasoningByCallID.mu.Lock()
+		delete(reasoningByCallID.m, "call_1")
+		reasoningByCallID.mu.Unlock()
+	})
+
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	// The client echoes the tool call back WITHOUT reasoning_content, as
+	// OpenCode/OpenAI SDKs always do.
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "virtual-a",
+		"messages": []map[string]any{
+			{"role": "user", "content": "what's the weather"},
+			{"role": "assistant", "content": "", "tool_calls": []map[string]any{
+				{"id": "call_1", "type": "function", "function": map[string]string{"name": "search_web", "arguments": `{"query":"weather"}`}},
+			}},
+			{"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("Messages len = %d, want 3", len(got.Messages))
+	}
+	if got.Messages[1].Role != chat.RoleAssistant {
+		t.Fatalf("Messages[1].Role = %q, want assistant", got.Messages[1].Role)
+	}
+	if got.Messages[1].ReasoningContent != "prior thinking" {
+		t.Errorf("Messages[1].ReasoningContent = %q, want prior thinking (echoed from cache)", got.Messages[1].ReasoningContent)
+	}
+	if got.Messages[0].ReasoningContent != "" {
+		t.Errorf("Messages[0].ReasoningContent = %q, want empty", got.Messages[0].ReasoningContent)
+	}
+}
+
+func TestChatCompletions_ServerToolEchoesReasoning(t *testing.T) {
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
+		return "cerah 32C", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	// The upstream's first completion carried reasoning_content with the tool
+	// call; the internal loop must echo it on the assistant message it appends.
+	p1 := &fakeProvider{
+		name: "p1",
+		scripted: []chat.ChatResponse{
+			{
+				FinishReason:     "tool_calls",
+				ReasoningContent: "thinking...",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"cuaca"}`),
+				}},
+			},
+			{Content: "suhu cerah 32C", FinishReason: "stop"},
+		},
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "cuaca hari ini?"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(p1.requests) != 2 {
+		t.Fatalf("provider called %d times, want 2", len(p1.requests))
+	}
+	msgs := p1.requests[1].Messages
+	if len(msgs) < 2 {
+		t.Fatalf("second request messages len = %d, want >= 2", len(msgs))
+	}
+	asst := msgs[len(msgs)-2]
+	if asst.Role != chat.RoleAssistant || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_1" {
+		t.Errorf("assistant message = %+v, want role assistant with tool call call_1", asst)
+	}
+	if asst.ReasoningContent != "thinking..." {
+		t.Errorf("assistant ReasoningContent = %q, want thinking... (echoed from upstream response)", asst.ReasoningContent)
+	}
+}
+
+func TestChatCompletions_StreamAllCandidatesFail(t *testing.T) {
+	// Every candidate errors before delivering any content: the client must get
+	// an error frame, not a misleading 200 with an empty stream.
+	p1 := &fakeProvider{
+		name: "p1",
+		stream: func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
+			return errors.New("p1 down")
+		},
+	}
+	p2 := &fakeProvider{
+		name: "p2",
+		stream: func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
+			return errors.New("p2 down")
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
+			{Provider: "p1", Model: "m1"},
+			{Provider: "p2", Model: "m2"},
+		}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body missing [DONE]: %q", body)
+	}
+	if !strings.Contains(body, `"error"`) {
+		t.Errorf("body missing error frame (misleading empty 200): %q", body)
+	}
+	if strings.Contains(body, `"finish_reason":"stop"`) || strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("body contains a success finish_reason: %q", body)
 	}
 }

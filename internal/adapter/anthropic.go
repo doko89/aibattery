@@ -23,18 +23,21 @@ type anthropicProvider struct {
 	apiKey  string
 	version string
 	client  *http.Client
+	timeout time.Duration
 }
 
 // NewAnthropicProvider returns a chat.Provider backed by the Anthropic
 // Messages API. baseURL is the API root (e.g. "https://api.anthropic.com/v1");
 // the adapter appends "/messages". version is the anthropic-version header
-// value (e.g. "2023-06-01"). timeout bounds each HTTP request.
+// value (e.g. "2023-06-01"). timeout bounds each non-streaming completion;
+// streaming uses the shared streamTimeout budget.
 func NewAnthropicProvider(baseURL, apiKey, version string, timeout time.Duration) chat.Provider {
 	return &anthropicProvider{
 		baseURL: baseURL,
 		apiKey:  apiKey,
 		version: version,
-		client:  &http.Client{Timeout: timeout},
+		client:  &http.Client{},
+		timeout: timeout,
 	}
 }
 
@@ -320,6 +323,8 @@ func anthropicFinishReason(s string) string {
 
 // Complete performs a non-streaming completion against /v1/messages.
 func (p *anthropicProvider) Complete(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
 	body, err := json.Marshal(buildAnthropicRequest(req))
 	if err != nil {
 		return chat.ChatResponse{}, fmt.Errorf("anthropic: marshal request: %w", err)
@@ -389,6 +394,8 @@ func (p *anthropicProvider) Complete(ctx context.Context, req chat.ChatRequest) 
 // Stream performs a streaming completion against /v1/messages, emitting each
 // text delta and a final chunk carrying the finish reason and usage.
 func (p *anthropicProvider) Stream(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+	ctx, cancel := context.WithTimeout(ctx, streamTimeout)
+	defer cancel()
 	req.Stream = true
 	body, err := json.Marshal(buildAnthropicRequest(req))
 	if err != nil {

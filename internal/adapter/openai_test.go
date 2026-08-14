@@ -542,3 +542,175 @@ func TestStream_ErrorAfterFirstDelta(t *testing.T) {
 		t.Errorf("deltas[1].FinishReason = %q, want error", deltas[1].FinishReason)
 	}
 }
+
+func TestOpenAI_ReasoningContentResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-r",
+			"model": "deepseek-v4-pro",
+			"choices": [{
+				"index": 0,
+				"message": {
+					"role": "assistant",
+					"content": null,
+					"reasoning_content": "thinking...",
+					"tool_calls": [{
+						"id": "call_1",
+						"type": "function",
+						"function": {"name": "search_web", "arguments": "{\"query\":\"x\"}"}
+					}]
+				},
+				"finish_reason": "tool_calls"
+			}],
+			"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+		}`)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProvider(srv.URL, "k", time.Second)
+	resp, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.ReasoningContent != "thinking..." {
+		t.Errorf("ReasoningContent = %q, want thinking...", resp.ReasoningContent)
+	}
+	if resp.FinishReason != "tool_calls" {
+		t.Errorf("FinishReason = %q, want tool_calls", resp.FinishReason)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_1" {
+		t.Errorf("ToolCalls = %+v, want call_1", resp.ToolCalls)
+	}
+}
+
+func TestOpenAI_ReasoningContentStream(t *testing.T) {
+	t.Run("tool calls", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			// DeepSeek streams reasoning_content fragments BEFORE the tool-call
+			// deltas; the fragments must be concatenated onto the final chunk.
+			fmt.Fprint(w, ""+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n"+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ing...\"}}]}\n\n"+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"loc\\\":\\\"Jakarta\\\"}\"}}]}}]}\n\n"+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
+				"data: [DONE]\n\n",
+			)
+		}))
+		defer srv.Close()
+
+		p := NewOpenAIProvider(srv.URL, "k", time.Second)
+		var deltas []chat.StreamDelta
+		err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
+			deltas = append(deltas, d)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		if len(deltas) != 1 {
+			t.Fatalf("got %d deltas, want 1: %+v", len(deltas), deltas)
+		}
+		final := deltas[0]
+		if final.FinishReason != "tool_calls" {
+			t.Errorf("FinishReason = %q, want tool_calls", final.FinishReason)
+		}
+		if final.ReasoningContent != "thinking..." {
+			t.Errorf("ReasoningContent = %q, want thinking... (concatenated fragments)", final.ReasoningContent)
+		}
+		if len(final.ToolCalls) != 1 || final.ToolCalls[0].ID != "call_1" {
+			t.Errorf("ToolCalls = %+v, want call_1", final.ToolCalls)
+		}
+	})
+
+	t.Run("plain content", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, ""+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n"+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n"+
+				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+				"data: [DONE]\n\n",
+			)
+		}))
+		defer srv.Close()
+
+		p := NewOpenAIProvider(srv.URL, "k", time.Second)
+		var deltas []chat.StreamDelta
+		err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
+			deltas = append(deltas, d)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		// content delta is emitted as-is; reasoning lands only on the final chunk
+		if len(deltas) != 2 {
+			t.Fatalf("got %d deltas, want 2: %+v", len(deltas), deltas)
+		}
+		if deltas[0].Delta != "answer" {
+			t.Errorf("deltas[0] = %+v, want content delta", deltas[0])
+		}
+		if deltas[0].ReasoningContent != "" {
+			t.Errorf("deltas[0].ReasoningContent = %q, want empty (reasoning only on final chunk)", deltas[0].ReasoningContent)
+		}
+		final := deltas[1]
+		if final.FinishReason != "stop" {
+			t.Errorf("FinishReason = %q, want stop", final.FinishReason)
+		}
+		if final.ReasoningContent != "let me think" {
+			t.Errorf("ReasoningContent = %q, want let me think", final.ReasoningContent)
+		}
+	})
+}
+
+func TestOpenAI_StreamTimeoutBudget(t *testing.T) {
+	// Provider timeout is tiny (30ms); the upstream thinks for 100ms before the
+	// first chunk. Streaming must NOT be bound by the provider timeout: it uses
+	// the generous streamTimeout budget, so this must succeed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprint(w, ""+
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n"+
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+			"data: [DONE]\n\n",
+		)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProvider(srv.URL, "k", 30*time.Millisecond)
+	var deltas []chat.StreamDelta
+	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
+		deltas = append(deltas, d)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream returned error %v; streaming must not be bound by the provider timeout", err)
+	}
+	if len(deltas) != 2 || deltas[0].Delta != "ok" || deltas[1].FinishReason != "stop" {
+		t.Errorf("deltas = %+v, want content ok then finish stop", deltas)
+	}
+}
+
+func TestOpenAI_CompleteRespectsTimeout(t *testing.T) {
+	// The upstream sleeps longer than the provider timeout; Complete must fail
+	// with a context deadline error (the configured timeout is a per-call
+	// budget, not a total http.Client deadline).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprint(w, `{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProvider(srv.URL, "k", 30*time.Millisecond)
+	_, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	if err == nil {
+		t.Fatal("Complete succeeded; want timeout error")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Errorf("Complete error = %v, want context deadline exceeded", err)
+	}
+}

@@ -213,6 +213,7 @@ func (a *anthropicSSEWriter) writeResponseBurst(resp chat.ChatResponse) error {
 // forwarded to a client that cannot run them.
 func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
+	virtualModel := cReq.Model
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -252,7 +253,7 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 
 		if streamErr != nil && !delivered {
 			s.deps.Logger.Warn("anthropic stream failed before content",
-				"provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
 			sel.RecordFailure(cand)
 			continue
 		}
@@ -262,6 +263,10 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 		} else {
 			sel.RecordSuccess(cand)
 		}
+		s.deps.Logger.Info("stream served",
+			"virtual_model", virtualModel,
+			"provider", cand.ProviderName,
+			"model", cand.Model)
 
 		if streamErr == nil && !endedInError {
 			// The stream completed cleanly: the buffered final chunk decides
@@ -269,16 +274,17 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 			// internally instead of being forwarded.
 			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
 			resp := responseFromDeltas(deltas)
+			s.rememberReasoning(&resp)
 			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
 				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
 				if err != nil {
 					s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
-						"provider", cand.ProviderName, "model", cand.Model, "error", err)
+						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 					_ = sw.errorEvent("tool execution failed: " + err.Error())
 					_ = sw.messageStop()
 				} else if err := sw.writeResponseBurst(*final); err != nil {
 					s.deps.Logger.Warn("anthropic stream write failed",
-						"provider", cand.ProviderName, "error", err)
+						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 				}
 				return
 			}
@@ -289,7 +295,7 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 		for _, d := range deltas {
 			if err := sw.emitDelta(d); err != nil {
 				s.deps.Logger.Warn("anthropic stream write failed",
-					"provider", cand.ProviderName, "error", err)
+					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
 				break
 			}
 		}
