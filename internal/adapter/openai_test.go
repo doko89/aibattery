@@ -136,6 +136,114 @@ func TestComplete_TranslationAndParsing(t *testing.T) {
 	}
 }
 
+func TestOpenAI_ReasoningContentBody(t *testing.T) {
+	var got openAIRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = captureRequest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProvider(srv.URL, "k", time.Second)
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "m",
+		Messages: []chat.Message{
+			{Role: chat.RoleAssistant, Content: "first", ReasoningContent: "thinking..."},
+			{Role: chat.RoleAssistant, Content: "plain"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages len = %d, want 2", len(got.Messages))
+	}
+	if got.Messages[0].ReasoningContent != "thinking..." {
+		t.Errorf("messages[0].reasoning_content = %q, want thinking...", got.Messages[0].ReasoningContent)
+	}
+	if got.Messages[1].ReasoningContent != "" {
+		t.Errorf("messages[1].reasoning_content = %q, want empty", got.Messages[1].ReasoningContent)
+	}
+	// A message without reasoning content must not carry the key on the wire.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	if strings.Contains(string(raw), `"reasoning_content":""`) {
+		t.Errorf("wire body contains empty reasoning_content key; want it omitted (omitempty)")
+	}
+}
+
+func TestOpenAI_ToolRoundTripBody(t *testing.T) {
+	var got openAIRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = captureRequest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProvider(srv.URL, "k", time.Second)
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "m",
+		Messages: []chat.Message{
+			{Role: chat.RoleUser, Content: "hi"},
+			{
+				Role: chat.RoleAssistant,
+				ToolCalls: []chat.ToolCall{
+					{ID: "call_1", Name: "search_web", Arguments: json.RawMessage(`{"query":"x"}`)},
+				},
+			},
+			{Role: chat.Role("tool"), ToolCallID: "call_1", Content: "result"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if len(got.Messages) != 3 {
+		t.Fatalf("messages len = %d, want 3", len(got.Messages))
+	}
+	assistant := got.Messages[1]
+	if assistant.Role != "assistant" {
+		t.Errorf("messages[1].Role = %q, want assistant", assistant.Role)
+	}
+	if len(assistant.ToolCalls) != 1 {
+		t.Fatalf("messages[1].ToolCalls len = %d, want 1", len(assistant.ToolCalls))
+	}
+	tc := assistant.ToolCalls[0]
+	if tc.ID != "call_1" {
+		t.Errorf("tool_calls[0].id = %q, want call_1", tc.ID)
+	}
+	if tc.Type != "function" {
+		t.Errorf("tool_calls[0].type = %q, want function", tc.Type)
+	}
+	if tc.Function.Name != "search_web" {
+		t.Errorf("tool_calls[0].function.name = %q, want search_web", tc.Function.Name)
+	}
+	if tc.Function.Arguments != `{"query":"x"}` {
+		t.Errorf("tool_calls[0].function.arguments = %q, want {\"query\":\"x\"}", tc.Function.Arguments)
+	}
+	if assistant.ToolCallID != "" {
+		t.Errorf("messages[1].tool_call_id = %q, want empty", assistant.ToolCallID)
+	}
+	toolMsg := got.Messages[2]
+	if toolMsg.Role != "tool" {
+		t.Errorf("messages[2].Role = %q, want tool", toolMsg.Role)
+	}
+	if toolMsg.Content != "result" {
+		t.Errorf("messages[2].Content = %q, want result", toolMsg.Content)
+	}
+	if toolMsg.ToolCallID != "call_1" {
+		t.Errorf("messages[2].tool_call_id = %q, want call_1", toolMsg.ToolCallID)
+	}
+	if len(toolMsg.ToolCalls) != 0 {
+		t.Errorf("messages[2].ToolCalls len = %d, want 0", len(toolMsg.ToolCalls))
+	}
+}
+
 func TestComplete_OmitEmptyFields(t *testing.T) {
 	var got openAIRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -450,6 +450,130 @@ func TestGeminiComplete_FunctionCallParsing(t *testing.T) {
 	}
 }
 
+// TestGemini_ToolRoundTripBody verifies that a multi-turn tool conversation is
+// serialized with assistant functionCall parts and user-role functionResponse
+// parts carrying matching ids.
+func TestGemini_ToolRoundTripBody(t *testing.T) {
+	var gotBody geminiRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
+	if _, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []chat.Message{
+			{Role: chat.RoleUser, Content: "hi"},
+			{
+				Role:    chat.RoleAssistant,
+				Content: "searching",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"x"}`),
+				}},
+			},
+			{Role: chat.Role("tool"), ToolCallID: "call_1", Content: "result"},
+		},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if len(gotBody.Contents) != 3 {
+		t.Fatalf("contents len = %d", len(gotBody.Contents))
+	}
+
+	// Assistant message: text part + functionCall part with parsed args and id.
+	model := gotBody.Contents[1]
+	if model.Role != "model" {
+		t.Errorf("assistant role = %q, want model", model.Role)
+	}
+	if len(model.Parts) != 2 {
+		t.Fatalf("assistant parts len = %d, want 2 (text + functionCall)", len(model.Parts))
+	}
+	if model.Parts[0].Text != "searching" {
+		t.Errorf("assistant text part = %q", model.Parts[0].Text)
+	}
+	fc := model.Parts[1].FunctionCall
+	if fc == nil {
+		t.Fatal("assistant parts[1] is not a functionCall")
+	}
+	if fc.Name != "search_web" || fc.ID != "call_1" {
+		t.Errorf("functionCall = %+v, want name search_web id call_1", fc)
+	}
+	if args := fc.Arguments; len(args) != 1 || args["query"] != "x" {
+		t.Errorf("functionCall args = %+v", fc.Arguments)
+	}
+
+	// Tool-result message: user role + functionResponse part matching the id.
+	tool := gotBody.Contents[2]
+	if tool.Role != "user" {
+		t.Errorf("tool-result role = %q, want user", tool.Role)
+	}
+	if len(tool.Parts) != 1 {
+		t.Fatalf("tool-result parts len = %d", len(tool.Parts))
+	}
+	fr := tool.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("tool-result parts[0] is not a functionResponse")
+	}
+	if fr.ID != "call_1" {
+		t.Errorf("functionResponse id = %q", fr.ID)
+	}
+	if fr.Name != "search_web" {
+		t.Errorf("functionResponse name = %q, want search_web (matched from assistant ToolCall.Name)", fr.Name)
+	}
+	if len(fr.Response) == 0 {
+		t.Errorf("functionResponse response = %+v, want non-empty", fr.Response)
+	}
+}
+
+// TestGemini_ToolResultJSONResponse verifies that a tool result whose content
+// is a JSON object is used verbatim as the functionResponse object.
+func TestGemini_ToolResultJSONResponse(t *testing.T) {
+	var gotBody geminiRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
+	if _, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []chat.Message{
+			{
+				Role: chat.RoleAssistant,
+				ToolCalls: []chat.ToolCall{{
+					ID:        "c2",
+					Name:      "get_weather",
+					Arguments: json.RawMessage(`{}`),
+				}},
+			},
+			{Role: chat.Role("tool"), ToolCallID: "c2", Content: `{"temp":22,"unit":"C"}`},
+		},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	fr := gotBody.Contents[1].Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("missing functionResponse part")
+	}
+	if fr.Name != "get_weather" {
+		t.Errorf("name = %q", fr.Name)
+	}
+	if len(fr.Response) != 2 || fr.Response["temp"] != float64(22) {
+		t.Errorf("response = %+v, want parsed JSON object", fr.Response)
+	}
+}
+
 // TestGeminiStream_FunctionCall verifies that a streaming chunk carrying a
 // functionCall part yields a final StreamDelta with FinishReason "tool_calls"
 // and the collected ToolCalls.

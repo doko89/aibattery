@@ -13,12 +13,20 @@ import (
 	"github.com/aibattery/router/internal/chat"
 	"github.com/aibattery/router/internal/config"
 	"github.com/aibattery/router/internal/routing"
+	toolkit "github.com/aibattery/router/internal/tools"
 )
 
 // newAnthropicStreamServer builds a Server (not the route handler — the
 // /anthropic/v1/messages route is registered elsewhere) plus the Selector for
 // the virtual model, so anthropicStream can be exercised directly.
 func newAnthropicStreamServer(t *testing.T, providers map[string]chat.Provider) (*Server, routing.Selector) {
+	t.Helper()
+	return newAnthropicStreamServerWithTools(t, providers, nil)
+}
+
+// newAnthropicStreamServerWithTools is newAnthropicStreamServer with an
+// optional tool registry (nil for none).
+func newAnthropicStreamServerWithTools(t *testing.T, providers map[string]chat.Provider, tr *toolkit.Registry) (*Server, routing.Selector) {
 	t.Helper()
 	reg, err := routing.NewRegistry([]config.ModelConfig{
 		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
@@ -34,6 +42,7 @@ func newAnthropicStreamServer(t *testing.T, providers map[string]chat.Provider) 
 		Providers: providers,
 		Registry:  reg,
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tools:     tr,
 	}}
 	return s, sel
 }
@@ -59,7 +68,7 @@ func TestAnthropicStream_TextDeltas(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
-	s.anthropicStream(rec, req, sel, chat.ChatRequest{Model: "virtual-a", Stream: true})
+	s.anthropicStream(rec, req, sel, chat.ChatRequest{Model: "virtual-a", Stream: true}, nil)
 
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
@@ -112,7 +121,7 @@ func TestAnthropicStream_ToolCalls(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
-	s.anthropicStream(rec, req, sel, chat.ChatRequest{Model: "virtual-a", Stream: true})
+	s.anthropicStream(rec, req, sel, chat.ChatRequest{Model: "virtual-a", Stream: true}, nil)
 
 	body := rec.Body.String()
 	for _, want := range []string{
@@ -152,5 +161,49 @@ func TestAnthropicStream_AuthMissingKeyReturns401(t *testing.T) {
 	}
 	if errResp.Error.Code != "invalid_api_key" || errResp.Error.Type != "authentication_error" {
 		t.Errorf("error = %+v, want code invalid_api_key type authentication_error", errResp.Error)
+	}
+}
+
+func TestAnthropicStream_ServerToolExecuted(t *testing.T) {
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
+		return "cerah 32C", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	p1 := &fakeProvider{
+		name: "p1",
+		stream: func(_ context.Context, _ chat.ChatRequest, emit chat.StreamFunc) error {
+			return emit(chat.StreamDelta{
+				FinishReason: "tool_calls",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"cuaca"}`),
+				}},
+			})
+		},
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "suhu cerah 32C", FinishReason: "stop"}, nil
+		},
+	}
+	s, sel := newAnthropicStreamServerWithTools(t, map[string]chat.Provider{"p1": p1}, tr)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
+	s.anthropicStream(rec, req, sel, chat.ChatRequest{Model: "virtual-a", Stream: true}, nil)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "cerah 32C") {
+		t.Errorf("body missing final content: %q", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Errorf("body missing end_turn: %q", body)
+	}
+	if strings.Contains(body, "tool_use") || strings.Contains(body, "search_web") {
+		t.Errorf("body leaks server tool call: %q", body)
+	}
+	if !strings.Contains(body, "event: message_stop") {
+		t.Errorf("body missing message_stop: %q", body)
 	}
 }

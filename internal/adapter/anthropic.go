@@ -48,9 +48,11 @@ func (p *anthropicProvider) endpoint() string {
 
 // ---- wire types -----------------------------------------------------------
 
+// anthropicMessage is a member of the messages array; Content is a plain
+// string or a slice of content blocks (tool_use / tool_result).
 type anthropicMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
 }
 
 type anthropicRequest struct {
@@ -81,11 +83,13 @@ type anthropicTool struct {
 }
 
 type anthropicBlock struct {
-	Type  string         `json:"type"`
-	Text  string         `json:"text"`
-	ID    string         `json:"id"`
-	Name  string         `json:"name"`
-	Input map[string]any `json:"input"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     *map[string]any `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   string          `json:"content,omitempty"`
 }
 
 type anthropicUsage struct {
@@ -198,7 +202,36 @@ func buildAnthropicRequest(req chat.ChatRequest) anthropicRequest {
 			// not a valid member of the messages array.
 			continue
 		}
-		out.Messages = append(out.Messages, anthropicMessage{Role: role, Content: m.Content})
+		wire := anthropicMessage{Role: role}
+		switch {
+		case m.Role == chat.Role("tool"):
+			wire.Content = []anthropicBlock{{
+				Type:      "tool_result",
+				ToolUseID: m.ToolCallID,
+				Content:   m.Content,
+			}}
+		case len(m.ToolCalls) > 0:
+			blocks := make([]anthropicBlock, 0, len(m.ToolCalls)+1)
+			if m.Content != "" {
+				blocks = append(blocks, anthropicBlock{Type: "text", Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				var input map[string]any
+				if err := json.Unmarshal(tc.Arguments, &input); err != nil || input == nil {
+					input = map[string]any{}
+				}
+				blocks = append(blocks, anthropicBlock{
+					Type:  "tool_use",
+					ID:    tc.ID,
+					Name:  tc.Name,
+					Input: &input,
+				})
+			}
+			wire.Content = blocks
+		default:
+			wire.Content = m.Content
+		}
+		out.Messages = append(out.Messages, wire)
 	}
 
 	return out
@@ -257,6 +290,10 @@ func anthropicRole(r chat.Role) string {
 		return "user"
 	case chat.RoleAssistant:
 		return "assistant"
+	case chat.Role("tool"):
+		// Tool results are sent as user messages; the tool_result content
+		// block itself carries the semantics.
+		return "user"
 	default:
 		return ""
 	}

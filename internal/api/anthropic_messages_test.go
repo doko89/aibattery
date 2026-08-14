@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/aibattery/router/internal/chat"
 	"github.com/aibattery/router/internal/config"
+	toolkit "github.com/aibattery/router/internal/tools"
 )
 
 // anthropicTestMessage mirrors the Anthropic non-streaming response shape for
@@ -147,6 +149,72 @@ func TestAnthropicMessages_ToolCalls(t *testing.T) {
 	}
 	if blk.Input["query"] != "news" {
 		t.Errorf("content[0].input = %v, want query news", blk.Input)
+	}
+}
+
+func TestAnthropic_ServerToolExecuted(t *testing.T) {
+	var gotArgs json.RawMessage
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, args json.RawMessage) (string, error) {
+		gotArgs = append(json.RawMessage(nil), args...)
+		return "cerah 32C", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	p1 := &fakeProvider{
+		name: "p1",
+		scripted: []chat.ChatResponse{
+			{
+				FinishReason: "tool_calls",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"cuaca"}`),
+				}},
+			},
+			{Content: "suhu cerah 32C", FinishReason: "stop"},
+		},
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
+		"model":      "virtual-a",
+		"max_tokens": 1024,
+		"messages":   []map[string]any{{"role": "user", "content": "cuaca hari ini?"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var out anthropicTestMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.StopReason != "end_turn" {
+		t.Errorf("stop_reason = %q, want end_turn", out.StopReason)
+	}
+	if len(out.Content) != 1 || out.Content[0].Type != "text" || !strings.Contains(out.Content[0].Text, "32C") {
+		t.Errorf("content = %+v, want text block containing 32C", out.Content)
+	}
+	if string(gotArgs) != `{"query":"cuaca"}` {
+		t.Errorf("tool args = %s, want {\"query\":\"cuaca\"}", gotArgs)
+	}
+	if len(p1.requests) != 2 {
+		t.Fatalf("provider called %d times, want 2", len(p1.requests))
+	}
+	msgs := p1.requests[1].Messages
+	if len(msgs) < 2 {
+		t.Fatalf("second request messages len = %d, want >= 2", len(msgs))
+	}
+	asst := msgs[len(msgs)-2]
+	if asst.Role != chat.RoleAssistant || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_1" {
+		t.Errorf("assistant message = %+v, want role assistant with tool call call_1", asst)
+	}
+	toolMsg := msgs[len(msgs)-1]
+	if toolMsg.Role != chat.RoleTool || toolMsg.ToolCallID != "call_1" || toolMsg.Content != "cerah 32C" {
+		t.Errorf("tool message = %+v, want role tool, call id call_1, content cerah 32C", toolMsg)
 	}
 }
 

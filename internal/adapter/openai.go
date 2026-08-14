@@ -43,8 +43,11 @@ func (p *openAIProvider) Name() string { return "openai" }
 
 // openAIMessage is a single message in the OpenAI request body.
 type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
 }
 
 // openAIFunction is the function definition inside an openAITool.
@@ -146,7 +149,32 @@ type openAIStreamChunk struct {
 func buildRequest(req chat.ChatRequest) ([]byte, error) {
 	messages := make([]openAIMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		messages = append(messages, openAIMessage{Role: string(m.Role), Content: m.Content})
+		msg := openAIMessage{Role: string(m.Role), Content: m.Content}
+		if m.ToolCallID != "" {
+			msg.ToolCallID = m.ToolCallID
+		}
+		if m.ReasoningContent != "" {
+			msg.ReasoningContent = m.ReasoningContent
+		}
+		if len(m.ToolCalls) > 0 {
+			calls := make([]openAIToolCall, 0, len(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				args := string(tc.Arguments)
+				if len(tc.Arguments) == 0 {
+					args = "{}"
+				}
+				calls = append(calls, openAIToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: tc.Name, Arguments: args},
+				})
+			}
+			msg.ToolCalls = calls
+		}
+		messages = append(messages, msg)
 	}
 
 	body := openAIRequest{

@@ -23,11 +23,22 @@ type fakeProvider struct {
 	name     string
 	complete func(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error)
 	stream   func(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error
+	// scripted, when non-empty, is popped one response per Complete call and
+	// takes precedence over complete.
+	scripted []chat.ChatResponse
+	// requests records every Complete and Stream call's request for assertions.
+	requests []chat.ChatRequest
 }
 
 func (f *fakeProvider) Name() string { return f.name }
 
 func (f *fakeProvider) Complete(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+	f.requests = append(f.requests, req)
+	if len(f.scripted) > 0 {
+		resp := f.scripted[0]
+		f.scripted = f.scripted[1:]
+		return resp, nil
+	}
 	if f.complete != nil {
 		return f.complete(ctx, req)
 	}
@@ -35,6 +46,7 @@ func (f *fakeProvider) Complete(ctx context.Context, req chat.ChatRequest) (chat
 }
 
 func (f *fakeProvider) Stream(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+	f.requests = append(f.requests, req)
 	if f.stream != nil {
 		return f.stream(ctx, req, emit)
 	}
@@ -807,5 +819,364 @@ func TestAuth_HealthExemptFromKey(t *testing.T) {
 	rec := doJSON(t, h, http.MethodGet, "/health", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestChatCompletions_ToolRoundTrip(t *testing.T) {
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "virtual-a",
+		"messages": []map[string]any{
+			{"role": "user", "content": "what's the weather"},
+			{"role": "assistant", "content": "", "tool_calls": []map[string]any{
+				{"id": "call_1", "type": "function", "function": map[string]string{"name": "search_web", "arguments": `{"query":"weather"}`}},
+			}},
+			{"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("Messages len = %d, want 3", len(got.Messages))
+	}
+	if got.Messages[0].Content != "what's the weather" {
+		t.Errorf("Messages[0].Content = %q, want what's the weather", got.Messages[0].Content)
+	}
+	tcs := got.Messages[1].ToolCalls
+	if len(tcs) != 1 {
+		t.Fatalf("Messages[1].ToolCalls len = %d, want 1", len(tcs))
+	}
+	if tcs[0].ID != "call_1" {
+		t.Errorf("ToolCalls[0].ID = %q, want call_1", tcs[0].ID)
+	}
+	if tcs[0].Name != "search_web" {
+		t.Errorf("ToolCalls[0].Name = %q, want search_web", tcs[0].Name)
+	}
+	if !strings.Contains(string(tcs[0].Arguments), "query") {
+		t.Errorf("ToolCalls[0].Arguments = %s, want it to contain query", tcs[0].Arguments)
+	}
+	if got.Messages[2].ToolCallID != "call_1" {
+		t.Errorf("Messages[2].ToolCallID = %q, want call_1", got.Messages[2].ToolCallID)
+	}
+	if got.Messages[2].Content != "sunny" {
+		t.Errorf("Messages[2].Content = %q, want sunny", got.Messages[2].Content)
+	}
+}
+
+func TestChatCompletions_ReasoningContentRoundTrip(t *testing.T) {
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "virtual-a",
+		"messages": []map[string]any{
+			{"role": "user", "content": "what's the weather"},
+			{"role": "assistant", "content": "", "reasoning_content": "thinking...", "tool_calls": []map[string]any{
+				{"id": "call_1", "type": "function", "function": map[string]string{"name": "search_web", "arguments": `{"query":"weather"}`}},
+			}},
+			{"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("Messages len = %d, want 3", len(got.Messages))
+	}
+	if got.Messages[1].ReasoningContent != "thinking..." {
+		t.Errorf("Messages[1].ReasoningContent = %q, want thinking...", got.Messages[1].ReasoningContent)
+	}
+	if got.Messages[1].Content != "" {
+		t.Errorf("Messages[1].Content = %q, want empty", got.Messages[1].Content)
+	}
+	if len(got.Messages[1].ToolCalls) != 1 {
+		t.Errorf("Messages[1].ToolCalls len = %d, want 1", len(got.Messages[1].ToolCalls))
+	}
+	if got.Messages[0].ReasoningContent != "" {
+		t.Errorf("Messages[0].ReasoningContent = %q, want empty", got.Messages[0].ReasoningContent)
+	}
+}
+
+func TestChatCompletions_ClientToolsPassthrough(t *testing.T) {
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	// deps.Tools is nil: no aggregated tools configured.
+	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"tools": []map[string]any{
+			{"type": "function", "function": map[string]any{"name": "my_tool", "description": "d", "parameters": map[string]any{"type": "object"}}},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got.Tools) != 1 {
+		t.Fatalf("Tools len = %d, want 1", len(got.Tools))
+	}
+	if got.Tools[0].Name != "my_tool" {
+		t.Errorf("Tools[0].Name = %q, want my_tool", got.Tools[0].Name)
+	}
+	if got.Tools[0].Description != "d" {
+		t.Errorf("Tools[0].Description = %q, want d", got.Tools[0].Description)
+	}
+	if got.Tools[0].InputSchema == nil {
+		t.Errorf("Tools[0].InputSchema = nil, want map")
+	}
+}
+
+func TestChatCompletions_ClientAndServerToolsMerged(t *testing.T) {
+	var got chat.ChatRequest
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	tr := toolkit.New()
+	if err := toolkit.RegisterBuiltin(tr); err != nil {
+		t.Fatalf("RegisterBuiltin() error = %v", err)
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"tools": []map[string]any{
+			{"type": "function", "function": map[string]any{"name": "my_tool", "description": "d", "parameters": map[string]any{"type": "object"}}},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// Client tools no longer replace the aggregated set: they are merged, so
+	// the server's tools are always offered alongside the client's.
+	if len(got.Tools) != 3 {
+		t.Fatalf("Tools len = %d, want 3 (my_tool + echo_text + get_utc_time)", len(got.Tools))
+	}
+	names := map[string]bool{}
+	for _, tl := range got.Tools {
+		names[tl.Name] = true
+	}
+	for _, want := range []string{"my_tool", "echo_text", "get_utc_time"} {
+		if !names[want] {
+			t.Errorf("merged tools missing %q: %+v", want, got.Tools)
+		}
+	}
+}
+
+func TestChatCompletions_ServerToolExecuted(t *testing.T) {
+	var gotArgs json.RawMessage
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, args json.RawMessage) (string, error) {
+		gotArgs = append(json.RawMessage(nil), args...)
+		return "cerah 32C", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	p1 := &fakeProvider{
+		name: "p1",
+		scripted: []chat.ChatResponse{
+			{
+				FinishReason: "tool_calls",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"cuaca"}`),
+				}},
+			},
+			{Content: "suhu cerah 32C", FinishReason: "stop"},
+		},
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "cuaca hari ini?"}},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var out chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop", out.Choices[0].FinishReason)
+	}
+	if !strings.Contains(out.Choices[0].Message.Content, "32C") {
+		t.Errorf("content = %q, want it to contain 32C", out.Choices[0].Message.Content)
+	}
+	if len(out.Choices[0].Message.ToolCalls) != 0 {
+		t.Errorf("client saw tool_calls = %+v, want none (router executed them)", out.Choices[0].Message.ToolCalls)
+	}
+	if string(gotArgs) != `{"query":"cuaca"}` {
+		t.Errorf("tool args = %s, want {\"query\":\"cuaca\"}", gotArgs)
+	}
+	if len(p1.requests) != 2 {
+		t.Fatalf("provider called %d times, want 2", len(p1.requests))
+	}
+	msgs := p1.requests[1].Messages
+	if len(msgs) < 2 {
+		t.Fatalf("second request messages len = %d, want >= 2", len(msgs))
+	}
+	asst := msgs[len(msgs)-2]
+	if asst.Role != chat.RoleAssistant || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_1" {
+		t.Errorf("assistant message = %+v, want role assistant with tool call call_1", asst)
+	}
+	toolMsg := msgs[len(msgs)-1]
+	if toolMsg.Role != chat.RoleTool || toolMsg.ToolCallID != "call_1" || toolMsg.Content != "cerah 32C" {
+		t.Errorf("tool message = %+v, want role tool, call id call_1, content cerah 32C", toolMsg)
+	}
+}
+
+func TestChatCompletions_ClientToolPassthrough(t *testing.T) {
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
+		return "unused", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	p1 := &fakeProvider{
+		name: "p1",
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{
+				FinishReason: "tool_calls",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "my_tool",
+					Arguments: json.RawMessage(`{"x":1}`),
+				}},
+			}, nil
+		},
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"tools": []map[string]any{
+			{"type": "function", "function": map[string]any{"name": "my_tool", "description": "d", "parameters": map[string]any{"type": "object"}}},
+		},
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var out chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	tc := out.Choices[0].Message.ToolCalls
+	if len(tc) != 1 || tc[0].ID != "call_1" || tc[0].Function.Name != "my_tool" {
+		t.Fatalf("tool_calls = %+v, want client tool call_1/my_tool passed through", tc)
+	}
+	if len(p1.requests) != 1 {
+		t.Errorf("provider called %d times, want 1 (no internal loop)", len(p1.requests))
+	}
+	if len(p1.requests) == 1 && len(p1.requests[0].Tools) != 2 {
+		t.Errorf("merged tool count = %d, want 2 (client my_tool + server search_web)", len(p1.requests[0].Tools))
+	}
+}
+
+func TestChatCompletions_StreamServerTool(t *testing.T) {
+	tr := toolkit.New()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
+		return "cerah 32C", nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+	streamCalls := 0
+	p1 := &fakeProvider{
+		name: "p1",
+		stream: func(_ context.Context, _ chat.ChatRequest, emit chat.StreamFunc) error {
+			streamCalls++
+			return emit(chat.StreamDelta{
+				FinishReason: "tool_calls",
+				ToolCalls: []chat.ToolCall{{
+					ID:        "call_1",
+					Name:      "search_web",
+					Arguments: json.RawMessage(`{"query":"cuaca"}`),
+				}},
+			})
+		},
+		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+			return chat.ChatResponse{Content: "suhu cerah 32C", FinishReason: "stop"}, nil
+		},
+	}
+	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
+		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	}, tr)
+
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "virtual-a",
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": "cuaca?"}},
+	})
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body missing [DONE]: %q", body)
+	}
+	if !strings.Contains(body, "cerah 32C") {
+		t.Errorf("body missing final content: %q", body)
+	}
+	if strings.Contains(body, "search_web") || strings.Contains(body, "tool_calls") {
+		t.Errorf("body leaks server tool call: %q", body)
+	}
+	if streamCalls != 1 {
+		t.Errorf("Stream called %d times, want 1", streamCalls)
+	}
+	if len(p1.requests) != 2 {
+		t.Fatalf("provider recorded %d requests, want 2 (stream turn + tool-loop continuation)", len(p1.requests))
+	}
+	if !p1.requests[0].Stream {
+		t.Errorf("first request Stream = %v, want true (client streamed)", p1.requests[0].Stream)
+	}
+	if p1.requests[1].Stream {
+		t.Errorf("tool-loop continuation request Stream = %v, want false (must complete, not stream)", p1.requests[1].Stream)
 	}
 }

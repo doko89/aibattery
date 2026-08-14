@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,14 +53,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error", "")
 		return
 	}
+	clientToolNames := clientToolNamesSet(cReq.Tools)
 	if s.deps.Tools != nil {
-		cReq.Tools = s.deps.Tools.List()
+		cReq.Tools = mergeTools(cReq.Tools, s.deps.Tools.List())
 	}
 	if req.Stream {
-		s.streamCompletion(w, r, sel, cReq)
+		s.streamCompletion(w, r, sel, cReq, clientToolNames)
 		return
 	}
-	s.complete(w, r, sel, cReq)
+	s.complete(w, r, sel, cReq, clientToolNames)
 }
 
 // validReasoningEffort reports whether v is a canonical reasoning effort
@@ -88,7 +90,18 @@ func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 			system = append(system, content)
 			continue
 		}
-		messages = append(messages, chat.Message{Role: chat.Role(m.Role), Content: content})
+		msg := chat.Message{Role: chat.Role(m.Role), Content: content, ToolCallID: m.ToolCallID, ReasoningContent: m.ReasoningContent}
+		if len(m.ToolCalls) > 0 {
+			msg.ToolCalls = make([]chat.ToolCall, 0, len(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				call := chat.ToolCall{ID: tc.ID, Name: tc.Function.Name}
+				if tc.Function.Arguments != "" && json.Valid([]byte(tc.Function.Arguments)) {
+					call.Arguments = json.RawMessage(tc.Function.Arguments)
+				}
+				msg.ToolCalls = append(msg.ToolCalls, call)
+			}
+		}
+		messages = append(messages, msg)
 	}
 
 	var maxTokens *int
@@ -97,7 +110,7 @@ func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 		maxTokens = &v
 	}
 
-	return chat.ChatRequest{
+	cReq := chat.ChatRequest{
 		Model:           req.Model,
 		Messages:        messages,
 		System:          strings.Join(system, "\n"),
@@ -105,14 +118,137 @@ func buildChatRequest(req chatCompletionRequest) (chat.ChatRequest, error) {
 		MaxTokens:       maxTokens,
 		ReasoningEffort: req.ReasoningEffort,
 		Stream:          req.Stream,
-	}, nil
+	}
+	if len(req.Tools) > 0 {
+		cReq.Tools = make([]chat.Tool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			cReq.Tools = append(cReq.Tools, chat.Tool{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				InputSchema: t.Function.Parameters,
+			})
+		}
+	}
+	return cReq, nil
+}
+
+// mergeTools appends the server tools not already present by Name to the
+// client's tool list. A client tool with the same name wins: its definition is
+// kept and the server duplicate skipped, so the client keeps executing the
+// tools it declares itself.
+func mergeTools(client, server []chat.Tool) []chat.Tool {
+	if len(server) == 0 {
+		return client
+	}
+	have := make(map[string]bool, len(client))
+	for _, t := range client {
+		have[t.Name] = true
+	}
+	out := make([]chat.Tool, 0, len(client)+len(server))
+	out = append(out, client...)
+	for _, t := range server {
+		if !have[t.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// clientToolNamesSet indexes the names of the tools the client itself sent, so
+// server-owned tool detection can exclude names the client executes.
+func clientToolNamesSet(tools []chat.Tool) map[string]bool {
+	names := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		names[t.Name] = true
+	}
+	return names
+}
+
+// serverOwned reports whether a tool call targets a server-registered tool
+// that the client did not itself declare. Calls to tools the client provided
+// (or that are absent from the registry) are the client's to execute.
+func (s *Server) serverOwned(tc chat.ToolCall, clientToolNames map[string]bool) bool {
+	return s.deps.Tools != nil && s.deps.Tools.Has(tc.Name) && !clientToolNames[tc.Name]
+}
+
+// allServerToolCalls reports whether calls is non-empty and every call is
+// server-owned. Mixed batches (client and server calls together) are passed
+// through to the client untouched, so they never trigger the internal loop.
+func (s *Server) allServerToolCalls(calls []chat.ToolCall, clientToolNames map[string]bool) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for _, tc := range calls {
+		if !s.serverOwned(tc, clientToolNames) {
+			return false
+		}
+	}
+	return true
+}
+
+// maxServerToolIterations caps the internal tool-execution loop.
+// ponytail: hard cap 5, raise if models need longer tool chains
+const maxServerToolIterations = 5
+
+// executeServerTools runs the internal tool-execution loop for a completed
+// response. When every tool call is server-owned, each call is executed
+// against the tool registry and the request extended with the assistant
+// tool-call message and its tool result, then the same provider is called
+// again with the extended conversation. It returns the first response that is
+// not all server-owned (client-owned or mixed batches pass through to the
+// client untouched), or resp unchanged when the iteration cap is exhausted.
+func (s *Server) executeServerTools(ctx context.Context, p chat.Provider, cReq *chat.ChatRequest, resp *chat.ChatResponse, clientToolNames map[string]bool) (*chat.ChatResponse, error) {
+	for i := 0; i < maxServerToolIterations; i++ {
+		if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+			return resp, nil
+		}
+		for _, tc := range resp.ToolCalls {
+			out, err := s.deps.Tools.Call(ctx, tc.Name, tc.Arguments)
+			if err != nil {
+				out = err.Error()
+			}
+			cReq.Messages = append(cReq.Messages,
+				chat.Message{Role: chat.RoleAssistant, ToolCalls: []chat.ToolCall{tc}},
+				chat.Message{Role: chat.RoleTool, ToolCallID: tc.ID, Content: out},
+			)
+		}
+		// The loop reuses the client's request, which may have Stream set
+		// (streaming client); the continuation must be a plain completion or
+		// the upstream answers with SSE and Complete fails to decode it.
+		cReq.Stream = false
+		next, err := p.Complete(ctx, *cReq)
+		if err != nil {
+			return nil, err
+		}
+		resp = &next
+	}
+	return resp, nil
+}
+
+// responseFromDeltas collapses a fully-buffered stream into the canonical
+// ChatResponse the final chunk implies: concatenated text, and the final
+// chunk's finish reason, tool calls and usage.
+func responseFromDeltas(deltas []chat.StreamDelta) chat.ChatResponse {
+	var resp chat.ChatResponse
+	for _, d := range deltas {
+		resp.Content += d.Delta
+		if d.FinishReason != "" {
+			resp.FinishReason = d.FinishReason
+			resp.ToolCalls = d.ToolCalls
+			if d.Usage != nil {
+				resp.Usage = *d.Usage
+			}
+		}
+	}
+	return resp
 }
 
 // complete runs the non-streaming failover loop. It iterates the selector's
 // candidates, forwarding the concrete model name to each provider, and returns
-// the first successful completion as OpenAI JSON. If every candidate fails it
+// the first successful completion as OpenAI JSON. Server-owned tool calls in a
+// completion are executed internally by the router. If every candidate fails it
 // responds 502.
-func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest) {
+func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
@@ -128,8 +264,15 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, sel routing.Se
 			sel.RecordFailure(cand)
 			continue
 		}
+		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+		if err != nil {
+			s.deps.Logger.Warn("provider completion failed during tool loop",
+				"provider", cand.ProviderName, "model", cand.Model, "error", err)
+			sel.RecordFailure(cand)
+			continue
+		}
 		sel.RecordSuccess(cand)
-		writeCompletion(w, cand.Model, resp)
+		writeCompletion(w, cand.Model, *final)
 		return
 	}
 	writeError(w, http.StatusBadGateway, "all model candidates failed", "upstream_error", "")
@@ -184,8 +327,10 @@ func toRespToolCalls(tcs []chat.ToolCall) []respToolCall {
 // streamCompletion runs the streaming failover loop. It writes SSE headers,
 // then iterates candidates. A candidate is only failed over when it errored
 // before delivering any content; once content is delivered the stream is
-// final and cannot be un-sent.
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest) {
+// final and cannot be un-sent. The upstream stream is buffered until its final
+// chunk so server-owned tool calls can be executed internally instead of being
+// forwarded to a client that cannot run them.
+func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -214,12 +359,14 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 
 		delivered := false
 		endedInError := false
+		var deltas []chat.StreamDelta
 		streamErr := p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
 			delivered = true
 			if d.FinishReason == "error" {
 				endedInError = true
 			}
-			return sw.writeChunk(cand.Model, d)
+			deltas = append(deltas, d)
+			return nil
 		})
 
 		if streamErr != nil && !delivered {
@@ -233,6 +380,36 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 			sel.RecordFailure(cand)
 		} else {
 			sel.RecordSuccess(cand)
+		}
+
+		if streamErr == nil && !endedInError {
+			// The stream completed cleanly: the buffered final chunk decides
+			// whether the tool calls belong to the server and must be executed
+			// internally instead of being forwarded.
+			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
+			resp := responseFromDeltas(deltas)
+			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+				if err != nil {
+					s.deps.Logger.Warn("provider completion failed during tool loop",
+						"provider", cand.ProviderName, "model", cand.Model, "error", err)
+					_ = sw.writeError("tool execution failed: " + err.Error())
+				} else if err := sw.writeResponseBurst(cand.Model, *final); err != nil {
+					s.deps.Logger.Warn("stream write failed",
+						"provider", cand.ProviderName, "error", err)
+				}
+				break
+			}
+		}
+
+		// Replay the buffered deltas (plain content, client-owned or mixed
+		// tool calls, or an error-terminated stream) exactly as they arrived.
+		for _, d := range deltas {
+			if err := sw.writeChunk(cand.Model, d); err != nil {
+				s.deps.Logger.Warn("stream write failed",
+					"provider", cand.ProviderName, "error", err)
+				break
+			}
 		}
 		break
 	}

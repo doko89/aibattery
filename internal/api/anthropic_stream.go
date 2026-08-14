@@ -136,13 +136,82 @@ func (a *anthropicSSEWriter) errorEvent(message string) error {
 	return a.event("error", anthropicErrorEnvelope{Type: "error", Error: anthropicErrorDetails{Type: "api_error", Message: message}})
 }
 
+// emitDelta translates one canonical StreamDelta into Anthropic SSE events:
+// a message_start, incremental text deltas, then on the final chunk the tail
+// (close text block, tool_use blocks, message_delta, message_stop).
+func (a *anthropicSSEWriter) emitDelta(d chat.StreamDelta) error {
+	if d.Usage != nil {
+		a.usage = d.Usage
+	}
+	if err := a.messageStart(); err != nil {
+		return err
+	}
+	if d.Delta != "" {
+		if err := a.openTextBlock(); err != nil {
+			return err
+		}
+		if err := a.textDelta(d.Delta); err != nil {
+			return err
+		}
+	}
+	if d.FinishReason == "" {
+		return nil
+	}
+	if err := a.closeTextBlock(); err != nil {
+		return err
+	}
+	for _, tc := range d.ToolCalls {
+		if err := a.toolUseBlock(tc); err != nil {
+			return err
+		}
+	}
+	if err := a.messageDelta(anthropicStopReason(d.FinishReason), d.Usage); err != nil {
+		return err
+	}
+	return a.messageStop()
+}
+
+// writeResponseBurst emits a completed non-streaming ChatResponse as the
+// Anthropic message event sequence: message_start, a text block when content
+// is present, one tool_use block per call, then the message_delta/message_stop
+// tail. Used to stream the result of the internal server-tool execution loop,
+// whose response was never streamed.
+func (a *anthropicSSEWriter) writeResponseBurst(resp chat.ChatResponse) error {
+	if resp.Usage != (chat.Usage{}) {
+		a.usage = &resp.Usage
+	}
+	if err := a.messageStart(); err != nil {
+		return err
+	}
+	if resp.Content != "" {
+		if err := a.openTextBlock(); err != nil {
+			return err
+		}
+		if err := a.textDelta(resp.Content); err != nil {
+			return err
+		}
+		if err := a.closeTextBlock(); err != nil {
+			return err
+		}
+	}
+	for _, tc := range resp.ToolCalls {
+		if err := a.toolUseBlock(tc); err != nil {
+			return err
+		}
+	}
+	if err := a.messageDelta(anthropicStopReason(resp.FinishReason), a.usage); err != nil {
+		return err
+	}
+	return a.messageStop()
+}
+
 // anthropicStream serves the streaming branch of POST /anthropic/v1/messages.
 // It mirrors the failover loop of streamCompletion: candidates are tried in
 // order and a candidate is only failed over when it errored before delivering
-// any content. Canonical StreamDelta chunks are translated into Anthropic SSE
-// events; the final chunk (FinishReason set) closes the open text block,
-// emits any tool_use blocks, then the message_delta/message_stop tail.
-func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest) {
+// any content. The upstream stream is buffered until its final chunk so
+// server-owned tool calls can be executed internally instead of being
+// forwarded to a client that cannot run them.
+func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -171,42 +240,14 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 
 		delivered := false
 		endedInError := false
+		var deltas []chat.StreamDelta
 		streamErr := p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
 			delivered = true
 			if d.FinishReason == "error" {
 				endedInError = true
 			}
-			if d.Usage != nil {
-				sw.usage = d.Usage
-			}
-			if err := sw.messageStart(); err != nil {
-				return err
-			}
-			if d.Delta != "" {
-				if err := sw.openTextBlock(); err != nil {
-					return err
-				}
-				if err := sw.textDelta(d.Delta); err != nil {
-					return err
-				}
-			}
-			if d.FinishReason == "" {
-				return nil
-			}
-			// Final chunk: close any open text block, then tool_use blocks,
-			// then the message tail.
-			if err := sw.closeTextBlock(); err != nil {
-				return err
-			}
-			for _, tc := range d.ToolCalls {
-				if err := sw.toolUseBlock(tc); err != nil {
-					return err
-				}
-			}
-			if err := sw.messageDelta(anthropicStopReason(d.FinishReason), d.Usage); err != nil {
-				return err
-			}
-			return sw.messageStop()
+			deltas = append(deltas, d)
+			return nil
 		})
 
 		if streamErr != nil && !delivered {
@@ -220,6 +261,37 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 			sel.RecordFailure(cand)
 		} else {
 			sel.RecordSuccess(cand)
+		}
+
+		if streamErr == nil && !endedInError {
+			// The stream completed cleanly: the buffered final chunk decides
+			// whether the tool calls belong to the server and must be executed
+			// internally instead of being forwarded.
+			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
+			resp := responseFromDeltas(deltas)
+			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+				if err != nil {
+					s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
+						"provider", cand.ProviderName, "model", cand.Model, "error", err)
+					_ = sw.errorEvent("tool execution failed: " + err.Error())
+					_ = sw.messageStop()
+				} else if err := sw.writeResponseBurst(*final); err != nil {
+					s.deps.Logger.Warn("anthropic stream write failed",
+						"provider", cand.ProviderName, "error", err)
+				}
+				return
+			}
+		}
+
+		// Replay the buffered deltas (plain content, client-owned or mixed
+		// tool calls, or an error-terminated stream) exactly as they arrived.
+		for _, d := range deltas {
+			if err := sw.emitDelta(d); err != nil {
+				s.deps.Logger.Warn("anthropic stream write failed",
+					"provider", cand.ProviderName, "error", err)
+				break
+			}
 		}
 		return
 	}

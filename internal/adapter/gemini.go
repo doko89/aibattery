@@ -66,13 +66,22 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text         string              `json:"text,omitempty"`
-	FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 }
 
 type geminiFunctionCall struct {
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"args"`
+	// Gemini requires functionCall.id to match the answering functionResponse.id.
+	ID string `json:"id,omitempty"`
+}
+
+type geminiFunctionResponse struct {
+	Name     string         `json:"name"`
+	Response map[string]any `json:"response"`
+	ID       string         `json:"id,omitempty"`
 }
 
 type geminiGenConfig struct {
@@ -115,7 +124,7 @@ func buildGeminiRequest(req chat.ChatRequest) ([]byte, error) {
 	for _, m := range req.Messages {
 		gr.Contents = append(gr.Contents, geminiContent{
 			Role:  geminiRole(m.Role),
-			Parts: []geminiPart{{Text: m.Content}},
+			Parts: geminiPartsFor(m, req.Messages),
 		})
 	}
 	if req.System != "" {
@@ -150,6 +159,79 @@ func buildGeminiRequest(req chat.ChatRequest) ([]byte, error) {
 		})
 	}
 	return json.Marshal(gr)
+}
+
+// geminiPartsFor translates one canonical Message into Gemini parts:
+//   - tool-result messages (role "tool") become a single functionResponse part
+//     in a "user" content; the response is the content parsed as a JSON object
+//     when possible, else {"result": content}.
+//   - assistant messages with ToolCalls emit one functionCall part per call
+//     (plus a text part when Content is non-empty).
+//   - everything else stays a plain text part.
+func geminiPartsFor(m chat.Message, messages []chat.Message) []geminiPart {
+	if m.Role == chat.Role("tool") {
+		return []geminiPart{{FunctionResponse: &geminiFunctionResponse{
+			Name:     toolNameFor(m, messages),
+			Response: toolResponseFor(m.Content),
+			ID:       m.ToolCallID,
+		}}}
+	}
+
+	if len(m.ToolCalls) == 0 {
+		return []geminiPart{{Text: m.Content}}
+	}
+
+	parts := make([]geminiPart, 0, 1+len(m.ToolCalls))
+	if m.Content != "" {
+		parts = append(parts, geminiPart{Text: m.Content})
+	}
+	for _, tc := range m.ToolCalls {
+		parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{
+			Name:      tc.Name,
+			Arguments: toolArguments(tc.Arguments),
+			ID:        tc.ID,
+		}})
+	}
+	return parts
+}
+
+// toolArguments unmarshals a tool call's raw JSON into a map; invalid or empty
+// input falls back to an empty object so the wire never carries a bad payload.
+func toolArguments(raw json.RawMessage) map[string]any {
+	var args map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &args) != nil {
+		return map[string]any{}
+	}
+	return args
+}
+
+// toolResponseFor turns a tool result's content into the functionResponse
+// object: a valid JSON object is used as-is, anything else becomes
+// {"result": content}.
+func toolResponseFor(content string) map[string]any {
+	if content == "" {
+		return map[string]any{"result": content}
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(content), &obj); err == nil && obj != nil {
+		return obj
+	}
+	return map[string]any{"result": content}
+}
+
+// toolNameFor resolves the tool name for a functionResponse. Canonical tool
+// messages carry no name (only ToolCallID + Content), so the name is matched
+// from the assistant ToolCall with the same ID earlier in the conversation.
+// Falls back to a placeholder when no match exists.
+func toolNameFor(m chat.Message, messages []chat.Message) string {
+	for _, prev := range messages {
+		for _, tc := range prev.ToolCalls {
+			if tc.ID != "" && tc.ID == m.ToolCallID {
+				return tc.Name
+			}
+		}
+	}
+	return "functionCallResponse"
 }
 
 // geminiThinkingConfigFor maps a canonical reasoning effort onto Gemini's

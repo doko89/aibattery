@@ -95,6 +95,28 @@ func (s *sseWriter) writeChunk(model string, d chat.StreamDelta) error {
 	return nil
 }
 
+// writeResponseBurst emits a completed non-streaming ChatResponse as a single
+// SSE burst: one content delta, then a final chunk carrying the finish reason,
+// any remaining tool calls and usage. Used to stream the result of the
+// internal server-tool execution loop, whose response was never streamed.
+func (s *sseWriter) writeResponseBurst(model string, resp chat.ChatResponse) error {
+	if resp.Content != "" {
+		if err := s.writeChunk(model, chat.StreamDelta{Delta: resp.Content}); err != nil {
+			return err
+		}
+	}
+	var usage *chat.Usage
+	if resp.Usage != (chat.Usage{}) {
+		u := resp.Usage
+		usage = &u
+	}
+	return s.writeChunk(model, chat.StreamDelta{
+		FinishReason: resp.FinishReason,
+		ToolCalls:    resp.ToolCalls,
+		Usage:        usage,
+	})
+}
+
 // writeError emits an SSE error frame (used when no candidate could be
 // selected, e.g. all models in cooldown).
 func (s *sseWriter) writeError(message string) error {

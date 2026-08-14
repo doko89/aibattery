@@ -89,8 +89,8 @@ func writeAnthropicError(w http.ResponseWriter, status int, typ, message string)
 // parseAnthropicMessageRequest translates the Anthropic wire body into a
 // canonical chat.ChatRequest and reports whether streaming was requested.
 // A missing max_tokens defaults to 1024 (Anthropic requires it, we are
-// lenient). Tools sent by the client replace rather than extend the
-// aggregated tool set.
+// lenient). Tools sent by the client are later merged with the aggregated
+// tool set (client definitions win on name collisions).
 func parseAnthropicMessageRequest(body []byte) (chat.ChatRequest, bool, error) {
 	var wire anthropicMessageRequest
 	if err := json.Unmarshal(body, &wire); err != nil {
@@ -187,23 +187,24 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if stream {
-		s.anthropicStream(w, r, sel, cReq)
-		return
+	clientToolNames := clientToolNamesSet(cReq.Tools)
+	if s.deps.Tools != nil {
+		cReq.Tools = mergeTools(cReq.Tools, s.deps.Tools.List())
 	}
 
-	// The aggregated tool set is offered only when the client sent none.
-	if len(cReq.Tools) == 0 && s.deps.Tools != nil {
-		cReq.Tools = s.deps.Tools.List()
+	if stream {
+		s.anthropicStream(w, r, sel, cReq, clientToolNames)
+		return
 	}
-	s.completeAnthropic(w, r, sel, cReq)
+	s.completeAnthropic(w, r, sel, cReq, clientToolNames)
 }
 
 // completeAnthropic runs the non-streaming failover loop, mirroring the
 // OpenAI flow in chat_completions.go: forward the concrete model name to each
 // candidate provider and return the first successful completion as an
-// Anthropic message. If every candidate fails it responds 502.
-func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest) {
+// Anthropic message. Server-owned tool calls in a completion are executed
+// internally by the router. If every candidate fails it responds 502.
+func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel routing.Selector, cReq chat.ChatRequest, clientToolNames map[string]bool) {
 	ctx := r.Context()
 	for _, cand := range sel.Begin() {
 		cReq.Model = cand.Model
@@ -219,8 +220,15 @@ func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel r
 			sel.RecordFailure(cand)
 			continue
 		}
+		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames)
+		if err != nil {
+			s.deps.Logger.Warn("provider completion failed during tool loop",
+				"provider", cand.ProviderName, "model", cand.Model, "error", err)
+			sel.RecordFailure(cand)
+			continue
+		}
 		sel.RecordSuccess(cand)
-		writeAnthropicMessage(w, cand.Model, resp)
+		writeAnthropicMessage(w, cand.Model, *final)
 		return
 	}
 	writeAnthropicError(w, http.StatusBadGateway, "api_error", "all model candidates failed")

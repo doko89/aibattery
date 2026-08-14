@@ -14,6 +14,9 @@ const (
 	RoleUser Role = "user"
 	// RoleAssistant marks a message produced by the model.
 	RoleAssistant Role = "assistant"
+	// RoleTool marks a message carrying the result of a tool call, linked to
+	// the assistant tool call it answers via ToolCallID.
+	RoleTool Role = "tool"
 )
 
 // Message is a single chat message. For v1 the content is plain text;
@@ -21,6 +24,16 @@ const (
 type Message struct {
 	Role    Role
 	Content string
+	// ToolCallID links a role=="tool" message to the assistant tool call it
+	// answers (OpenAI wire tool_call_id / Anthropic tool_result tool_use_id).
+	ToolCallID string
+	// ToolCalls carries assistant-role tool invocations back to the model
+	// in multi-turn conversations. Arguments is the raw JSON object.
+	ToolCalls []ToolCall
+	// ReasoningContent is the model's chain-of-thought text (DeepSeek
+	// `reasoning_content`), which thinking-mode APIs require to be echoed
+	// back on assistant messages in multi-turn conversations.
+	ReasoningContent string
 }
 
 // ChatRequest is the canonical request accepted by every provider. It is the

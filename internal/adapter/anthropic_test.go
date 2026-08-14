@@ -384,6 +384,116 @@ func TestAnthropicName(t *testing.T) {
 	}
 }
 
+func TestAnthropic_ToolRoundTripBody(t *testing.T) {
+	var got struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	defer srv.Close()
+
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "claude-sonnet-4-6",
+		Messages: []chat.Message{
+			{Role: chat.RoleUser, Content: "hi"},
+			{Role: chat.RoleAssistant, ToolCalls: []chat.ToolCall{
+				{ID: "call_1", Name: "search_web", Arguments: json.RawMessage(`{"query":"x"}`)},
+			}},
+			{Role: chat.Role("tool"), ToolCallID: "call_1", Content: "result"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if len(got.Messages) != 3 {
+		t.Fatalf("messages len = %d, want 3", len(got.Messages))
+	}
+	if got.Messages[0].Role != "user" {
+		t.Errorf("messages[0].role = %q, want user", got.Messages[0].Role)
+	}
+	if got.Messages[1].Role != "assistant" {
+		t.Errorf("messages[1].role = %q, want assistant", got.Messages[1].Role)
+	}
+	if got.Messages[2].Role != "user" {
+		t.Errorf("messages[2].role = %q, want user (tool results ride on user messages)", got.Messages[2].Role)
+	}
+
+	var toolUse []anthropicBlock
+	if err := json.Unmarshal(got.Messages[1].Content, &toolUse); err != nil {
+		t.Fatalf("unmarshal tool_use blocks: %v", err)
+	}
+	if len(toolUse) != 1 {
+		t.Fatalf("tool_use blocks len = %d, want 1", len(toolUse))
+	}
+	if toolUse[0].Type != "tool_use" || toolUse[0].ID != "call_1" || toolUse[0].Name != "search_web" {
+		t.Errorf("tool_use block = %+v", toolUse[0])
+	}
+	if (*toolUse[0].Input)["query"] != "x" {
+		t.Errorf("tool_use input = %v, want {\"query\":\"x\"}", toolUse[0].Input)
+	}
+
+	var toolResult []anthropicBlock
+	if err := json.Unmarshal(got.Messages[2].Content, &toolResult); err != nil {
+		t.Fatalf("unmarshal tool_result blocks: %v", err)
+	}
+	if len(toolResult) != 1 {
+		t.Fatalf("tool_result blocks len = %d, want 1", len(toolResult))
+	}
+	if toolResult[0].Type != "tool_result" || toolResult[0].ToolUseID != "call_1" || toolResult[0].Content != "result" {
+		t.Errorf("tool_result block = %+v", toolResult[0])
+	}
+}
+
+func TestAnthropic_ToolRoundTripInvalidArgs(t *testing.T) {
+	var got struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	defer srv.Close()
+
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "claude-sonnet-4-6",
+		Messages: []chat.Message{
+			{Role: chat.RoleAssistant, ToolCalls: []chat.ToolCall{
+				{ID: "call_1", Name: "search_web", Arguments: json.RawMessage("not json")},
+				{ID: "call_2", Name: "empty_args"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	var blocks []anthropicBlock
+	if err := json.Unmarshal(got.Messages[0].Content, &blocks); err != nil {
+		t.Fatalf("unmarshal blocks: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks len = %d, want 2", len(blocks))
+	}
+	for i, b := range blocks {
+		if b.Type != "tool_use" {
+			t.Errorf("blocks[%d].type = %q, want tool_use", i, b.Type)
+		}
+		if b.Input == nil {
+			t.Errorf("blocks[%d].input is nil, want {}", i)
+		}
+	}
+}
+
 func TestAnthropicComplete_ToolsSerialization(t *testing.T) {
 	var got anthropicCaptureRequest
 	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
