@@ -233,7 +233,7 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 		return
 	}
 
-	if s.runAnthropicCandidates(ctx, sw, sel, &cReq, candidates, clientToolNames, session, virtualModel) {
+	if s.runAnthropicCandidates(anthropicStreamEnv{ctx: ctx, sw: sw, sel: sel, cReq: &cReq, clientToolNames: clientToolNames, session: session, virtualModel: virtualModel}, candidates) {
 		return
 	}
 	// Every candidate failed before delivering any content.
@@ -241,30 +241,50 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 	_ = sw.messageStop()
 }
 
+// anthropicStreamEnv groups the stream-scoped dependencies shared by the
+// anthropic candidate helpers.
+type anthropicStreamEnv struct {
+	ctx             context.Context
+	sw              *anthropicSSEWriter
+	sel             routing.Selector
+	cReq            *chat.ChatRequest
+	clientToolNames map[string]bool
+	session         string
+	virtualModel    string
+}
+
+// anthropicCandidateState groups the per-candidate state served or burst
+// from a buffered upstream stream.
+type anthropicCandidateState struct {
+	p    chat.Provider
+	cand routing.Candidate
+	got  streamCapture
+}
+
 // runAnthropicCandidates tries each candidate in order. It reports whether any
 // candidate delivered content (or errored after content), making the stream
 // final.
-func (s *Server) runAnthropicCandidates(ctx context.Context, sw *anthropicSSEWriter, sel routing.Selector, cReq *chat.ChatRequest, candidates []routing.Candidate, clientToolNames map[string]bool, session, virtualModel string) bool {
+func (s *Server) runAnthropicCandidates(env anthropicStreamEnv, candidates []routing.Candidate) bool {
 	for _, cand := range candidates {
-		cReq.Model = cand.Model
+		env.cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
 		if !ok {
-			sel.RecordFailure(cand)
+			env.sel.RecordFailure(cand)
 			continue
 		}
-		got := captureStream(ctx, p, *cReq)
+		got := captureStream(env.ctx, p, *env.cReq)
 		if got.err != nil && !got.delivered {
 			s.deps.Logger.Warn("anthropic stream failed before content",
-				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", got.err)
-			sel.RecordFailure(cand)
+				"virtual_model", env.virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", got.err)
+			env.sel.RecordFailure(cand)
 			continue
 		}
-		s.recordAnthropicOutcome(sel, cand, got.endedInError)
+		s.recordAnthropicOutcome(env.sel, cand, got.endedInError)
 		s.deps.Logger.Info("stream served",
-			"virtual_model", virtualModel,
+			"virtual_model", env.virtualModel,
 			"provider", cand.ProviderName,
 			"model", cand.Model)
-		s.serveAnthropicCapture(ctx, sw, p, cReq, cand, got, clientToolNames, session, virtualModel)
+		s.serveAnthropicCapture(env, anthropicCandidateState{p: p, cand: cand, got: got})
 		return true
 	}
 	return false
@@ -283,16 +303,16 @@ func (s *Server) recordAnthropicOutcome(sel routing.Selector, cand routing.Candi
 // serveAnthropicCapture serves one candidate's buffered stream: server-owned
 // tool calls are executed internally as an event burst, everything else is
 // replayed exactly as it arrived.
-func (s *Server) serveAnthropicCapture(ctx context.Context, sw *anthropicSSEWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, got streamCapture, clientToolNames map[string]bool, session, virtualModel string) {
-	if s.tryServeAnthropicToolBurst(ctx, sw, p, cReq, cand, got, clientToolNames, session, virtualModel) {
+func (s *Server) serveAnthropicCapture(env anthropicStreamEnv, state anthropicCandidateState) {
+	if s.tryServeAnthropicToolBurst(env, state) {
 		return
 	}
 	// Replay the buffered deltas (plain content, client-owned or mixed
 	// tool calls, or an error-terminated stream) exactly as they arrived.
-	for _, d := range got.deltas {
-		if err := sw.emitDelta(d); err != nil {
+	for _, d := range state.got.deltas {
+		if err := env.sw.emitDelta(d); err != nil {
 			s.deps.Logger.Warn("anthropic stream write failed",
-				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+				"virtual_model", env.virtualModel, "provider", state.cand.ProviderName, "model", state.cand.Model, "error", err)
 			break
 		}
 	}
@@ -301,30 +321,30 @@ func (s *Server) serveAnthropicCapture(ctx context.Context, sw *anthropicSSEWrit
 // tryServeAnthropicToolBurst executes server-owned tool calls internally and
 // emits the result as an Anthropic event burst. It reports whether the burst
 // path was taken (so the caller must not replay the buffered deltas).
-func (s *Server) tryServeAnthropicToolBurst(ctx context.Context, sw *anthropicSSEWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, got streamCapture, clientToolNames map[string]bool, session, virtualModel string) bool {
-	if got.err != nil || got.endedInError {
+func (s *Server) tryServeAnthropicToolBurst(env anthropicStreamEnv, state anthropicCandidateState) bool {
+	if state.got.err != nil || state.got.endedInError {
 		return false
 	}
 	// The stream completed cleanly: the buffered final chunk decides
 	// whether the tool calls belong to the server and must be executed
 	// internally instead of being forwarded.
 	// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
-	resp := responseFromDeltas(got.deltas)
-	s.rememberReasoning(session, &resp)
-	if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+	resp := responseFromDeltas(state.got.deltas)
+	s.rememberReasoning(env.session, &resp)
+	if !s.allServerToolCalls(resp.ToolCalls, env.clientToolNames) {
 		return false
 	}
-	final, err := s.executeServerTools(ctx, p, cReq, &resp, clientToolNames, session)
+	final, err := s.executeServerTools(env.ctx, state.p, env.cReq, &resp, env.clientToolNames, env.session)
 	if err != nil {
 		s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-		_ = sw.errorEvent("tool execution failed: " + err.Error())
-		_ = sw.messageStop()
+			"virtual_model", env.virtualModel, "provider", state.cand.ProviderName, "model", state.cand.Model, "error", err)
+		_ = env.sw.errorEvent("tool execution failed: " + err.Error())
+		_ = env.sw.messageStop()
 		return true
 	}
-	if err := sw.writeResponseBurst(*final); err != nil {
+	if err := env.sw.writeResponseBurst(*final); err != nil {
 		s.deps.Logger.Warn("anthropic stream write failed",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+			"virtual_model", env.virtualModel, "provider", state.cand.ProviderName, "model", state.cand.Model, "error", err)
 	}
 	return true
 }
