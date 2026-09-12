@@ -87,6 +87,152 @@ func doJSON(t *testing.T, h http.Handler, method, path string, body any) *httpte
 	return rec
 }
 
+// Shared test helpers below capture the repetition patterns across the
+// chat-completions handler tests: provider boilerplate, single/dual failover
+// configs, request bodies, and builtin tool servers. They only build fixtures;
+// every behavioral assertion stays in the individual tests.
+
+// mc builds a single model candidate for a failover model config.
+func mc(provider, model string) config.ModelCandidate {
+	return config.ModelCandidate{Provider: provider, Model: model}
+}
+
+// failoverModels builds a one-model failover config for virtualName.
+func failoverModels(virtualName string, cands ...config.ModelCandidate) []config.ModelConfig {
+	return []config.ModelConfig{{Name: virtualName, Strategy: "failover", Candidates: cands}}
+}
+
+// newCompleteProvider wraps a Complete func in a fakeProvider.
+func newCompleteProvider(name string, fn func(ctx context.Context, req chat.ChatRequest) (chat.ChatResponse, error)) *fakeProvider {
+	return &fakeProvider{name: name, complete: fn}
+}
+
+// newStreamProvider wraps a Stream func in a fakeProvider.
+func newStreamProvider(name string, fn func(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error) *fakeProvider {
+	return &fakeProvider{name: name, stream: fn}
+}
+
+// okComplete returns a Complete func that succeeds with a canned "ok" reply.
+func okComplete(id, model string) func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+	return func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		return chat.ChatResponse{ID: id, Model: model, Content: "ok", FinishReason: "stop"}, nil
+	}
+}
+
+// staticComplete returns a Complete func that always succeeds with resp.
+func staticComplete(resp chat.ChatResponse) func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+	return func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		return resp, nil
+	}
+}
+
+// failComplete returns a Complete func that always fails with msg.
+func failComplete(msg string) func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+	return func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		return chat.ChatResponse{}, errors.New(msg)
+	}
+}
+
+// toolCallResponse builds a tool_calls finish response for a single call.
+func toolCallResponse(id, name, args string) chat.ChatResponse {
+	return chat.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls: []chat.ToolCall{{
+			ID:        id,
+			Name:      name,
+			Arguments: json.RawMessage(args),
+		}},
+	}
+}
+
+// scriptedToolProvider builds a provider that first emits a tool call for
+// toolName and then follows up with followup content. reasoning carries the
+// upstream reasoning_content attached to the tool-call turn ("" for none).
+func scriptedToolProvider(name, callID, toolName, args, reasoning, followup string) *fakeProvider {
+	return &fakeProvider{
+		name: name,
+		scripted: []chat.ChatResponse{
+			{
+				FinishReason:     "tool_calls",
+				ReasoningContent: reasoning,
+				ToolCalls: []chat.ToolCall{{
+					ID:        callID,
+					Name:      toolName,
+					Arguments: json.RawMessage(args),
+				}},
+			},
+			{Content: followup, FinishReason: "stop"},
+		},
+	}
+}
+
+// newSingleServer builds a Server with one failover candidate (p1/m1).
+func newSingleServer(t *testing.T, providers map[string]chat.Provider) http.Handler {
+	t.Helper()
+	return newTestServer(t, providers, failoverModels("virtual-a", mc("p1", "m1")))
+}
+
+// newDualServer builds a Server with two failover candidates (p1/m1, p2/m2).
+func newDualServer(t *testing.T, providers map[string]chat.Provider) http.Handler {
+	t.Helper()
+	return newTestServer(t, providers, failoverModels("virtual-a", mc("p1", "m1"), mc("p2", "m2")))
+}
+
+// newSingleToolServer builds a tool-enabled Server with one candidate.
+func newSingleToolServer(t *testing.T, providers map[string]chat.Provider, tr *toolkit.Registry) http.Handler {
+	t.Helper()
+	return newToolTestServer(t, providers, failoverModels("virtual-a", mc("p1", "m1")), tr)
+}
+
+// mustBuiltinTools returns a registry with the builtin tools registered.
+func mustBuiltinTools(t *testing.T) *toolkit.Registry {
+	t.Helper()
+	tr := toolkit.New()
+	if err := toolkit.RegisterBuiltin(tr); err != nil {
+		t.Fatalf("RegisterBuiltin() error = %v", err)
+	}
+	return tr
+}
+
+// mustRegisterSearchWeb registers a "search_web" local tool returning result.
+func mustRegisterSearchWeb(t *testing.T, tr *toolkit.Registry, result string) {
+	t.Helper()
+	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
+		return result, nil
+	}); err != nil {
+		t.Fatalf("RegisterLocal() error = %v", err)
+	}
+}
+
+// captureOkProvider builds a provider that records its request in got and
+// succeeds with a canned "ok" reply.
+func captureOkProvider(name string, got *chat.ChatRequest) *fakeProvider {
+	return &fakeProvider{
+		name: name,
+		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+			*got = req
+			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+}
+
+// chatBody builds a minimal chat-completions request body.
+func chatBody(model, content string) map[string]any {
+	return map[string]any{
+		"model":    model,
+		"messages": []map[string]string{{"role": "user", "content": content}},
+	}
+}
+
+// streamChatBody builds a streaming chat-completions request body.
+func streamChatBody(model, content string) map[string]any {
+	return map[string]any{
+		"model":    model,
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": content}},
+	}
+}
+
 func TestNonStreamSuccess(t *testing.T) {
 	p1 := &fakeProvider{
 		name: "p1",
@@ -103,14 +249,9 @@ func TestNonStreamSuccess(t *testing.T) {
 			}, nil
 		},
 	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -154,9 +295,7 @@ func TestChatCompletions_ContentArray(t *testing.T) {
 			return chat.ChatResponse{Content: "world", FinishReason: "stop"}, nil
 		},
 	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model": "virtual-a",
@@ -171,12 +310,7 @@ func TestChatCompletions_ContentArray(t *testing.T) {
 }
 
 func TestFailoverToSecondCandidate(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{}, errors.New("p1 down")
-		},
-	}
+	p1 := newCompleteProvider("p1", failComplete("p1 down"))
 	p2 := &fakeProvider{
 		name: "p2",
 		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
@@ -186,17 +320,9 @@ func TestFailoverToSecondCandidate(t *testing.T) {
 			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
 		},
 	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
-	})
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -218,13 +344,10 @@ func TestFailoverToSecondCandidate(t *testing.T) {
 // candidate.
 func TestRateLimit429_FailoverWithCooldown(t *testing.T) {
 	var p1Calls int
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			p1Calls++
-			return chat.ChatResponse{}, &chat.RateLimitError{Provider: "p1", StatusCode: http.StatusTooManyRequests, Message: "rate limited"}
-		},
-	}
+	p1 := newCompleteProvider("p1", func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		p1Calls++
+		return chat.ChatResponse{}, &chat.RateLimitError{Provider: "p1", StatusCode: http.StatusTooManyRequests, Message: "rate limited"}
+	})
 	p2 := &fakeProvider{
 		name: "p2",
 		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
@@ -234,14 +357,9 @@ func TestRateLimit429_FailoverWithCooldown(t *testing.T) {
 			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
 		},
 	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
-	})
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	body := map[string]any{"model": "virtual-a", "messages": []map[string]string{{"role": "user", "content": "hi"}}}
+	body := chatBody("virtual-a", "hi")
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
 	if rec.Code != http.StatusOK {
@@ -267,33 +385,17 @@ func TestRateLimit429_FailoverWithCooldown(t *testing.T) {
 // retried on the same candidate up to maxAttempts before failing over.
 func TestNonRateLimit_RetriesSameCandidate3x(t *testing.T) {
 	var p1Calls int
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			p1Calls++
-			if p1Calls < 3 {
-				return chat.ChatResponse{}, errors.New("p1 transient down")
-			}
-			return chat.ChatResponse{Content: "from p1 after retries", FinishReason: "stop"}, nil
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{Content: "should not be reached", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newCompleteProvider("p1", func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		p1Calls++
+		if p1Calls < 3 {
+			return chat.ChatResponse{}, errors.New("p1 transient down")
+		}
+		return chat.ChatResponse{Content: "from p1 after retries", FinishReason: "stop"}, nil
 	})
+	p2 := newCompleteProvider("p2", staticComplete(chat.ChatResponse{Content: "should not be reached", FinishReason: "stop"}))
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -315,27 +417,14 @@ func TestNonRateLimit_RetriesSameCandidate3x(t *testing.T) {
 // is NOT cooldowned (tried again on the next request).
 func TestNonRateLimit_FailsAllRetriesThenFailoverNoCooldown(t *testing.T) {
 	var p1Calls int
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			p1Calls++
-			return chat.ChatResponse{}, errors.New("p1 down")
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newCompleteProvider("p1", func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		p1Calls++
+		return chat.ChatResponse{}, errors.New("p1 down")
 	})
+	p2 := newCompleteProvider("p2", staticComplete(chat.ChatResponse{Content: "from p2", FinishReason: "stop"}))
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	body := map[string]any{"model": "virtual-a", "messages": []map[string]string{{"role": "user", "content": "hi"}}}
+	body := chatBody("virtual-a", "hi")
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", body)
 	if rec.Code != http.StatusOK {
@@ -360,30 +449,14 @@ func TestNonRateLimit_FailsAllRetriesThenFailoverNoCooldown(t *testing.T) {
 // the first try, so the candidate is hit exactly once.
 func TestPermanent4xx_NoRetryFailsOverImmediately(t *testing.T) {
 	var p1Calls int
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			p1Calls++
-			return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusBadRequest, Message: "invalid request"}
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newCompleteProvider("p1", func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		p1Calls++
+		return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusBadRequest, Message: "invalid request"}
 	})
+	p2 := newCompleteProvider("p2", staticComplete(chat.ChatResponse{Content: "from p2", FinishReason: "stop"}))
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -404,30 +477,14 @@ func TestPermanent4xx_NoRetryFailsOverImmediately(t *testing.T) {
 // retried up to maxAttempts on the same candidate before failing over.
 func TestTransient5xx_Retries3x(t *testing.T) {
 	var p1Calls int
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			p1Calls++
-			return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusInternalServerError, Message: "boom"}
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{Content: "from p2", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newCompleteProvider("p1", func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
+		p1Calls++
+		return chat.ChatResponse{}, &chat.ProviderError{Provider: "p1", StatusCode: http.StatusInternalServerError, Message: "boom"}
 	})
+	p2 := newCompleteProvider("p2", staticComplete(chat.ChatResponse{Content: "from p2", FinishReason: "stop"}))
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -476,20 +533,10 @@ func TestReasoningCache_PersistsToDisk(t *testing.T) {
 }
 
 func TestAllCandidatesFailReturns502(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{}, errors.New("p1 down")
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := newCompleteProvider("p1", failComplete("p1 down"))
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%s", rec.Code, rec.Body.String())
@@ -505,14 +552,9 @@ func TestAllCandidatesFailReturns502(t *testing.T) {
 
 func TestUnknownModelReturns404(t *testing.T) {
 	p1 := &fakeProvider{name: "p1"}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "nope",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("nope", "hi"))
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
@@ -528,9 +570,7 @@ func TestUnknownModelReturns404(t *testing.T) {
 
 func TestMissingModelReturns400(t *testing.T) {
 	p1 := &fakeProvider{name: "p1"}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"messages": []map[string]string{{"role": "user", "content": "hi"}},
@@ -542,28 +582,19 @@ func TestMissingModelReturns400(t *testing.T) {
 }
 
 func TestStreaming(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		stream: func(_ context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
-			if req.Model != "m1" {
-				t.Errorf("stream got model %q, want m1", req.Model)
-			}
-			if err := emit(chat.StreamDelta{Delta: "Hello"}); err != nil {
-				return err
-			}
-			usage := chat.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}
-			return emit(chat.StreamDelta{Delta: " world", FinishReason: "stop", Usage: &usage})
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	p1 := newStreamProvider("p1", func(_ context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+		if req.Model != "m1" {
+			t.Errorf("stream got model %q, want m1", req.Model)
+		}
+		if err := emit(chat.StreamDelta{Delta: "Hello"}); err != nil {
+			return err
+		}
+		usage := chat.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}
+		return emit(chat.StreamDelta{Delta: " world", FinishReason: "stop", Usage: &usage})
 	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", streamChatBody("virtual-a", "hi"))
 
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
@@ -590,27 +621,10 @@ func TestStreaming(t *testing.T) {
 }
 
 func TestNonStreamToolCalls(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{
-				FinishReason: "tool_calls",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "search_web",
-					Arguments: json.RawMessage(`{"query":"news"}`),
-				}},
-			}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := newCompleteProvider("p1", staticComplete(toolCallResponse("call_1", "search_web", `{"query":"news"}`)))
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -639,31 +653,22 @@ func TestNonStreamToolCalls(t *testing.T) {
 }
 
 func TestStreamingToolCalls(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		stream: func(_ context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
-			if err := emit(chat.StreamDelta{Delta: "Hello"}); err != nil {
-				return err
-			}
-			return emit(chat.StreamDelta{
-				FinishReason: "tool_calls",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "search_web",
-					Arguments: json.RawMessage(`{"query":"news"}`),
-				}},
-			})
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	p1 := newStreamProvider("p1", func(_ context.Context, _ chat.ChatRequest, emit chat.StreamFunc) error {
+		if err := emit(chat.StreamDelta{Delta: "Hello"}); err != nil {
+			return err
+		}
+		return emit(chat.StreamDelta{
+			FinishReason: "tool_calls",
+			ToolCalls: []chat.ToolCall{{
+				ID:        "call_1",
+				Name:      "search_web",
+				Arguments: json.RawMessage(`{"query":"news"}`),
+			}},
+		})
 	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", streamChatBody("virtual-a", "hi"))
 
 	body := rec.Body.String()
 	if !strings.Contains(body, `"tool_calls":[{"function":{"arguments":"{\"query\":\"news\"}","name":"search_web"},"id":"call_1","type":"function"}]`) {
@@ -684,36 +689,21 @@ func TestStreamingToolCalls(t *testing.T) {
 }
 
 func TestStreamingFailoverBeforeContent(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		stream: func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
-			return errors.New("p1 stream down")
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		stream: func(_ context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
-			if req.Model != "m2" {
-				t.Errorf("stream got model %q, want m2", req.Model)
-			}
-			if err := emit(chat.StreamDelta{Delta: "recovered"}); err != nil {
-				return err
-			}
-			return emit(chat.StreamDelta{FinishReason: "stop"})
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newStreamProvider("p1", func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
+		return errors.New("p1 stream down")
 	})
+	p2 := newStreamProvider("p2", func(_ context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
+		if req.Model != "m2" {
+			t.Errorf("stream got model %q, want m2", req.Model)
+		}
+		if err := emit(chat.StreamDelta{Delta: "recovered"}); err != nil {
+			return err
+		}
+		return emit(chat.StreamDelta{FinishReason: "stop"})
+	})
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", streamChatBody("virtual-a", "hi"))
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
@@ -754,9 +744,7 @@ func TestModelsListsNames(t *testing.T) {
 
 func TestHealth(t *testing.T) {
 	p1 := &fakeProvider{name: "p1"}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodGet, "/health", nil)
 	if rec.Code != http.StatusOK {
@@ -781,13 +769,8 @@ func newToolTestServer(t *testing.T, providers map[string]chat.Provider, models 
 }
 
 func TestToolsListsRegisteredTools(t *testing.T) {
-	tr := toolkit.New()
-	if err := toolkit.RegisterBuiltin(tr); err != nil {
-		t.Fatalf("RegisterBuiltin() error = %v", err)
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	tr := mustBuiltinTools(t)
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, tr)
 
 	rec := doJSON(t, h, http.MethodGet, "/v1/tools", nil)
 
@@ -819,13 +802,8 @@ func TestToolsListsRegisteredTools(t *testing.T) {
 }
 
 func TestToolCallSuccess(t *testing.T) {
-	tr := toolkit.New()
-	if err := toolkit.RegisterBuiltin(tr); err != nil {
-		t.Fatalf("RegisterBuiltin() error = %v", err)
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	tr := mustBuiltinTools(t)
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, tr)
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/tools/call", map[string]any{
 		"name":      "echo_text",
@@ -848,13 +826,8 @@ func TestToolCallSuccess(t *testing.T) {
 }
 
 func TestToolCallUnknownToolReturns404(t *testing.T) {
-	tr := toolkit.New()
-	if err := toolkit.RegisterBuiltin(tr); err != nil {
-		t.Fatalf("RegisterBuiltin() error = %v", err)
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	tr := mustBuiltinTools(t)
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, tr)
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/tools/call", map[string]any{
 		"name":      "nope",
@@ -878,16 +851,11 @@ func TestToolCallUnknownToolReturns404(t *testing.T) {
 
 func TestReasoningEffortPassthrough(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{ID: "resp-1", Model: "m1", Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
+	p1 := newCompleteProvider("p1", func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
+		got = req
+		return chat.ChatResponse{ID: "resp-1", Model: "m1", Content: "ok", FinishReason: "stop"}, nil
 	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":            "virtual-a",
@@ -901,10 +869,7 @@ func TestReasoningEffortPassthrough(t *testing.T) {
 		t.Errorf("ReasoningEffort = %v, want non-nil \"high\"", got.ReasoningEffort)
 	}
 
-	rec = doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec = doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
@@ -915,9 +880,7 @@ func TestReasoningEffortPassthrough(t *testing.T) {
 
 func TestReasoningEffort_InvalidValueReturns400(t *testing.T) {
 	p1 := &fakeProvider{name: "p1"}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":            "virtual-a",
@@ -941,15 +904,8 @@ func TestReasoningEffort_InvalidValueReturns400(t *testing.T) {
 }
 
 func TestReasoningEffort_ValidValuesAccepted(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{ID: "resp-1", Model: "m1", Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := newCompleteProvider("p1", okComplete("resp-1", "m1"))
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	for _, v := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
 		rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
@@ -965,9 +921,7 @@ func TestReasoningEffort_ValidValuesAccepted(t *testing.T) {
 
 func TestReasoningEffort_CaseSensitive(t *testing.T) {
 	p1 := &fakeProvider{name: "p1"}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":            "virtual-a",
@@ -1008,10 +962,7 @@ func newKeyedTestServer(t *testing.T, providers map[string]chat.Provider, client
 func TestAuth_MissingHeaderReturns401(t *testing.T) {
 	h := newKeyedTestServer(t, map[string]chat.Provider{"p1": &fakeProvider{name: "p1"}}, "secret")
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
@@ -1039,12 +990,7 @@ func TestAuth_WrongKeyReturns401(t *testing.T) {
 }
 
 func TestAuth_CorrectKeySucceeds(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{ID: "resp-1", Model: "m1", Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
+	p1 := newCompleteProvider("p1", okComplete("resp-1", "m1"))
 	h := newKeyedTestServer(t, map[string]chat.Provider{"p1": p1}, "secret")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"virtual-a","messages":[{"role":"user","content":"hi"}]}`))
@@ -1058,18 +1004,10 @@ func TestAuth_CorrectKeySucceeds(t *testing.T) {
 }
 
 func TestAuth_DisabledAllowsNoHeader(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{ID: "resp-1", Model: "m1", Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
+	p1 := newCompleteProvider("p1", okComplete("resp-1", "m1"))
 	h := newKeyedTestServer(t, map[string]chat.Provider{"p1": p1}, "")
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "hi"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -1087,16 +1025,8 @@ func TestAuth_HealthExemptFromKey(t *testing.T) {
 
 func TestChatCompletions_ToolRoundTrip(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := captureOkProvider("p1", &got)
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model": "virtual-a",
@@ -1141,16 +1071,8 @@ func TestChatCompletions_ToolRoundTrip(t *testing.T) {
 
 func TestChatCompletions_ReasoningContentRoundTrip(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := captureOkProvider("p1", &got)
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model": "virtual-a",
@@ -1185,17 +1107,9 @@ func TestChatCompletions_ReasoningContentRoundTrip(t *testing.T) {
 
 func TestChatCompletions_ClientToolsPassthrough(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
+	p1 := captureOkProvider("p1", &got)
 	// deps.Tools is nil: no aggregated tools configured.
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":    "virtual-a",
@@ -1224,20 +1138,9 @@ func TestChatCompletions_ClientToolsPassthrough(t *testing.T) {
 
 func TestChatCompletions_ClientAndServerToolsMerged(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	tr := toolkit.New()
-	if err := toolkit.RegisterBuiltin(tr); err != nil {
-		t.Fatalf("RegisterBuiltin() error = %v", err)
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	p1 := captureOkProvider("p1", &got)
+	tr := mustBuiltinTools(t)
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": p1}, tr)
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":    "virtual-a",
@@ -1275,28 +1178,10 @@ func TestChatCompletions_ServerToolExecuted(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RegisterLocal() error = %v", err)
 	}
-	p1 := &fakeProvider{
-		name: "p1",
-		scripted: []chat.ChatResponse{
-			{
-				FinishReason: "tool_calls",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "search_web",
-					Arguments: json.RawMessage(`{"query":"cuaca"}`),
-				}},
-			},
-			{Content: "suhu cerah 32C", FinishReason: "stop"},
-		},
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	p1 := scriptedToolProvider("p1", "call_1", "search_web", `{"query":"cuaca"}`, "", "suhu cerah 32C")
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": p1}, tr)
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "cuaca hari ini?"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "cuaca hari ini?"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -1336,27 +1221,9 @@ func TestChatCompletions_ServerToolExecuted(t *testing.T) {
 
 func TestChatCompletions_ClientToolPassthrough(t *testing.T) {
 	tr := toolkit.New()
-	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
-		return "unused", nil
-	}); err != nil {
-		t.Fatalf("RegisterLocal() error = %v", err)
-	}
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{
-				FinishReason: "tool_calls",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "my_tool",
-					Arguments: json.RawMessage(`{"x":1}`),
-				}},
-			}, nil
-		},
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	mustRegisterSearchWeb(t, tr, "unused")
+	p1 := newCompleteProvider("p1", staticComplete(toolCallResponse("call_1", "my_tool", `{"x":1}`)))
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": p1}, tr)
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model":    "virtual-a",
@@ -1387,11 +1254,7 @@ func TestChatCompletions_ClientToolPassthrough(t *testing.T) {
 
 func TestChatCompletions_StreamServerTool(t *testing.T) {
 	tr := toolkit.New()
-	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
-		return "cerah 32C", nil
-	}); err != nil {
-		t.Fatalf("RegisterLocal() error = %v", err)
-	}
+	mustRegisterSearchWeb(t, tr, "cerah 32C")
 	streamCalls := 0
 	p1 := &fakeProvider{
 		name: "p1",
@@ -1406,19 +1269,11 @@ func TestChatCompletions_StreamServerTool(t *testing.T) {
 				}},
 			})
 		},
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{Content: "suhu cerah 32C", FinishReason: "stop"}, nil
-		},
+		complete: staticComplete(chat.ChatResponse{Content: "suhu cerah 32C", FinishReason: "stop"}),
 	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": p1}, tr)
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": "cuaca?"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", streamChatBody("virtual-a", "cuaca?"))
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
@@ -1461,16 +1316,8 @@ func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
 	})
 
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := captureOkProvider("p1", &got)
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	// The client echoes the tool call back WITHOUT reasoning_content, as
 	// OpenCode/OpenAI SDKs always do.
@@ -1509,16 +1356,8 @@ func TestChatCompletions_ReasoningContentEchoed(t *testing.T) {
 // a failover chain accept the turn instead of 400ing.
 func TestChatCompletions_ReasoningEchoMissInjectsPlaceholder(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	})
+	p1 := captureOkProvider("p1", &got)
+	h := newSingleServer(t, map[string]chat.Provider{"p1": p1})
 
 	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
 		"model": "virtual-a",
@@ -1545,36 +1384,13 @@ func TestChatCompletions_ReasoningEchoMissInjectsPlaceholder(t *testing.T) {
 
 func TestChatCompletions_ServerToolEchoesReasoning(t *testing.T) {
 	tr := toolkit.New()
-	if err := tr.RegisterLocal(chat.Tool{Name: "search_web", Description: "search", InputSchema: map[string]any{"type": "object"}}, func(context.Context, json.RawMessage) (string, error) {
-		return "cerah 32C", nil
-	}); err != nil {
-		t.Fatalf("RegisterLocal() error = %v", err)
-	}
+	mustRegisterSearchWeb(t, tr, "cerah 32C")
 	// The upstream's first completion carried reasoning_content with the tool
 	// call; the internal loop must echo it on the assistant message it appends.
-	p1 := &fakeProvider{
-		name: "p1",
-		scripted: []chat.ChatResponse{
-			{
-				FinishReason:     "tool_calls",
-				ReasoningContent: "thinking...",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "search_web",
-					Arguments: json.RawMessage(`{"query":"cuaca"}`),
-				}},
-			},
-			{Content: "suhu cerah 32C", FinishReason: "stop"},
-		},
-	}
-	h := newToolTestServer(t, map[string]chat.Provider{"p1": p1}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
-	}, tr)
+	p1 := scriptedToolProvider("p1", "call_1", "search_web", `{"query":"cuaca"}`, "thinking...", "suhu cerah 32C")
+	h := newSingleToolServer(t, map[string]chat.Provider{"p1": p1}, tr)
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]string{{"role": "user", "content": "cuaca hari ini?"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", chatBody("virtual-a", "cuaca hari ini?"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -1598,30 +1414,15 @@ func TestChatCompletions_ServerToolEchoesReasoning(t *testing.T) {
 func TestChatCompletions_StreamAllCandidatesFail(t *testing.T) {
 	// Every candidate errors before delivering any content: the client must get
 	// an error frame, not a misleading 200 with an empty stream.
-	p1 := &fakeProvider{
-		name: "p1",
-		stream: func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
-			return errors.New("p1 down")
-		},
-	}
-	p2 := &fakeProvider{
-		name: "p2",
-		stream: func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
-			return errors.New("p2 down")
-		},
-	}
-	h := newTestServer(t, map[string]chat.Provider{"p1": p1, "p2": p2}, []config.ModelConfig{
-		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{
-			{Provider: "p1", Model: "m1"},
-			{Provider: "p2", Model: "m2"},
-		}},
+	p1 := newStreamProvider("p1", func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
+		return errors.New("p1 down")
 	})
+	p2 := newStreamProvider("p2", func(context.Context, chat.ChatRequest, chat.StreamFunc) error {
+		return errors.New("p2 down")
+	})
+	h := newDualServer(t, map[string]chat.Provider{"p1": p1, "p2": p2})
 
-	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "virtual-a",
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	rec := doJSON(t, h, http.MethodPost, "/v1/chat/completions", streamChatBody("virtual-a", "hi"))
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
