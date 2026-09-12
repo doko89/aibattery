@@ -161,64 +161,96 @@ type openAIStreamChunk struct {
 
 // buildRequest marshals a canonical ChatRequest into the OpenAI wire body.
 func buildRequest(req chat.ChatRequest) ([]byte, error) {
-	messages := make([]openAIMessage, 0, len(req.Messages))
-	for _, m := range req.Messages {
-		msg := openAIMessage{Role: string(m.Role), Content: m.Content}
-		if m.ToolCallID != "" {
-			msg.ToolCallID = m.ToolCallID
-		}
-		if m.ReasoningContent != "" {
-			msg.ReasoningContent = m.ReasoningContent
-		}
-		if len(m.ToolCalls) > 0 {
-			calls := make([]openAIToolCall, 0, len(m.ToolCalls))
-			for _, tc := range m.ToolCalls {
-				args := string(tc.Arguments)
-				if len(tc.Arguments) == 0 {
-					args = "{}"
-				}
-				calls = append(calls, openAIToolCall{
-					ID:   tc.ID,
-					Type: "function",
-					Function: struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					}{Name: tc.Name, Arguments: args},
-				})
-			}
-			msg.ToolCalls = calls
-		}
-		messages = append(messages, msg)
-	}
-
 	body := openAIRequest{
 		Model:       req.Model,
-		Messages:    messages,
+		Messages:    openAIMessages(req.Messages),
 		Stream:      req.Stream,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 	}
-	// Reasoning models reject temperature; drop it uniformly when reasoning
-	// effort is active (GPT-5.2 accepts it, but we drop by design).
-	if req.ReasoningEffort != nil {
-		body.ReasoningEffort = req.ReasoningEffort
-		body.Temperature = nil
-	}
+	applyOpenAIReasoning(req, &body)
 	if len(req.Tools) > 0 {
-		tools := make([]openAITool, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			tools = append(tools, openAITool{
-				Type: "function",
-				Function: openAIFunction{
-					Name:        t.Name,
-					Description: t.Description,
-					Parameters:  t.InputSchema,
-				},
-			})
-		}
-		body.Tools = tools
+		body.Tools = openAITools(req.Tools)
 	}
 	return json.Marshal(body)
+}
+
+// openAIMessages converts canonical messages to the OpenAI wire shape.
+func openAIMessages(messages []chat.Message) []openAIMessage {
+	out := make([]openAIMessage, 0, len(messages))
+	for _, m := range messages {
+		out = append(out, openAIMessageFor(m))
+	}
+	return out
+}
+
+// openAIMessageFor converts one canonical message.
+func openAIMessageFor(m chat.Message) openAIMessage {
+	msg := openAIMessage{Role: string(m.Role), Content: m.Content}
+	if m.ToolCallID != "" {
+		msg.ToolCallID = m.ToolCallID
+	}
+	if m.ReasoningContent != "" {
+		msg.ReasoningContent = m.ReasoningContent
+	}
+	if len(m.ToolCalls) > 0 {
+		msg.ToolCalls = openAIToolCalls(m.ToolCalls)
+	}
+	return msg
+}
+
+// openAIToolCalls converts canonical tool calls to the OpenAI wire shape.
+func openAIToolCalls(calls []chat.ToolCall) []openAIToolCall {
+	out := make([]openAIToolCall, 0, len(calls))
+	for _, tc := range calls {
+		out = append(out, openAIToolCallFor(tc))
+	}
+	return out
+}
+
+// openAIToolCallFor converts one canonical tool call; empty arguments become
+// "{}" so the wire never carries a missing arguments string.
+func openAIToolCallFor(tc chat.ToolCall) openAIToolCall {
+	args := string(tc.Arguments)
+	if len(tc.Arguments) == 0 {
+		args = "{}"
+	}
+	return openAIToolCall{
+		ID:   tc.ID,
+		Type: "function",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: tc.Name, Arguments: args},
+	}
+}
+
+// applyOpenAIReasoning sets reasoning_effort and drops temperature, which
+// reasoning models reject (dropped uniformly by design).
+func applyOpenAIReasoning(req chat.ChatRequest, body *openAIRequest) {
+	if req.ReasoningEffort == nil {
+		return
+	}
+	// Reasoning models reject temperature; drop it uniformly when reasoning
+	// effort is active (GPT-5.2 accepts it, but we drop by design).
+	body.ReasoningEffort = req.ReasoningEffort
+	body.Temperature = nil
+}
+
+// openAITools converts canonical tool definitions to the OpenAI wire shape.
+func openAITools(tools []chat.Tool) []openAITool {
+	out := make([]openAITool, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, openAITool{
+			Type: "function",
+			Function: openAIFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.InputSchema,
+			},
+		})
+	}
+	return out
 }
 
 // mapUsage converts an OpenAI usage object into the canonical chat.Usage.
@@ -340,119 +372,228 @@ func (p *openAIProvider) Stream(ctx context.Context, req chat.ChatRequest, emit 
 	ctx, cancel := context.WithTimeout(ctx, streamTimeout)
 	defer cancel()
 	req.Stream = true
+	resp, err := p.doStreamRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return consumeOpenAIStream(resp.Body, emit)
+}
+
+// doStreamRequest issues the streaming HTTP request and maps non-2xx
+// responses to typed errors. The caller owns closing the response body.
+func (p *openAIProvider) doStreamRequest(ctx context.Context, req chat.ChatRequest) (*http.Response, error) {
 	payload, err := buildRequest(req)
 	if err != nil {
-		return fmt.Errorf("provider openai: marshal request: %w", err)
+		return nil, fmt.Errorf("provider openai: marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(), bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("provider openai: build request: %w", err)
+		return nil, fmt.Errorf("provider openai: build request: %w", err)
 	}
 	p.setHeaders(httpReq, true)
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("provider openai: %w", err)
+		return nil, fmt.Errorf("provider openai: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if resp.StatusCode == http.StatusTooManyRequests {
-			return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
+			return nil, &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 		}
-		return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
+		return nil, &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 	}
+	return resp, nil
+}
 
-	emitted := false
-	acc := make(map[int]*toolCallAccum)
-	var reasoning strings.Builder // stream-global: DeepSeek streams reasoning before any tool-call delta
-	scanner := bufio.NewScanner(resp.Body)
+// consumeOpenAIStream parses the SSE frame stream and drives emit.
+func consumeOpenAIStream(r io.Reader, emit chat.StreamFunc) error {
+	st := newOpenAIStreamState()
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
+		payload, ok := openAIStreamPayload(scanner.Text())
+		if !ok {
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
-			continue
+		done, err := handleOpenAIStreamPayload(payload, st, emit)
+		if err != nil {
+			return err
 		}
-		if payload == "[DONE]" {
-			if len(acc) > 0 {
-				_ = emit(buildToolCallDelta("stop", nil, acc, reasoning.String()))
-			}
-			return nil
-		}
-
-		var chunk openAIStreamChunk
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			if !emitted {
-				return fmt.Errorf("provider openai: decode chunk: %w", err)
-			}
-			_ = emit(chat.StreamDelta{FinishReason: "error"})
-			return nil
-		}
-
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		choice := chunk.Choices[0]
-
-		if choice.Delta.Content != "" {
-			emitted = true
-			if err := emit(chat.StreamDelta{Delta: choice.Delta.Content}); err != nil {
-				return err
-			}
-		}
-
-		if choice.Delta.ReasoningContent != "" {
-			reasoning.WriteString(choice.Delta.ReasoningContent)
-		}
-
-		for _, tc := range choice.Delta.ToolCalls {
-			a := acc[tc.Index]
-			if a == nil {
-				a = &toolCallAccum{}
-				acc[tc.Index] = a
-			}
-			if tc.ID != "" {
-				a.id = tc.ID
-			}
-			if tc.Function.Name != "" {
-				a.name = tc.Function.Name
-			}
-			if tc.Function.Arguments != "" {
-				a.args.WriteString(tc.Function.Arguments)
-			}
-		}
-
-		if choice.FinishReason != "" {
-			var usage *chat.Usage
-			if chunk.Usage != nil {
-				u := mapUsage(*chunk.Usage)
-				usage = &u
-			}
-			_ = emit(buildToolCallDelta(choice.FinishReason, usage, acc, reasoning.String()))
+		if done {
 			return nil
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		if !emitted {
-			return fmt.Errorf("provider openai: read stream: %w", err)
-		}
-		_ = emit(chat.StreamDelta{FinishReason: "error"})
-		return nil
+		return handleOpenAIScanError(err, st, emit)
 	}
 
+	return finishOpenAIStream(st, emit)
+}
+
+// openAIStreamState accumulates streaming progress across SSE frames.
+type openAIStreamState struct {
+	emitted bool
+	acc     map[int]*toolCallAccum
+	// reasoning is stream-global: DeepSeek streams reasoning before any
+	// tool-call delta.
+	reasoning strings.Builder
+}
+
+// newOpenAIStreamState returns an initialized stream state.
+func newOpenAIStreamState() *openAIStreamState {
+	return &openAIStreamState{acc: make(map[int]*toolCallAccum)}
+}
+
+// openAIStreamPayload extracts the payload of a `data:` SSE line; ok is
+// false for non-data lines and empty payloads (both are skipped).
+func openAIStreamPayload(line string) (string, bool) {
+	if !strings.HasPrefix(line, "data:") {
+		return "", false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" {
+		return "", false
+	}
+	return payload, true
+}
+
+// handleOpenAIStreamPayload processes one SSE payload. done is true when the
+// stream is finished and the caller must return.
+func handleOpenAIStreamPayload(payload string, st *openAIStreamState, emit chat.StreamFunc) (bool, error) {
+	if payload == "[DONE]" {
+		handleOpenAIDone(st, emit)
+		return true, nil
+	}
+	chunk, done, err := parseOpenAIChunk(payload, st, emit)
+	if err != nil || done || chunk == nil {
+		return done, err
+	}
+	return applyOpenAIChoice(chunk, st, emit)
+}
+
+// handleOpenAIDone handles the [DONE] sentinel: pending tool calls are
+// flushed with a stop delta, otherwise the stream simply ends.
+func handleOpenAIDone(st *openAIStreamState, emit chat.StreamFunc) {
+	if len(st.acc) > 0 {
+		_ = emit(buildToolCallDelta("stop", nil, st.acc, st.reasoning.String()))
+	}
+}
+
+// parseOpenAIChunk decodes one frame. done is true when the frame ended the
+// stream (malformed payload after content: error delta already emitted).
+func parseOpenAIChunk(payload string, st *openAIStreamState, emit chat.StreamFunc) (*openAIStreamChunk, bool, error) {
+	var chunk openAIStreamChunk
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		if !st.emitted {
+			return nil, false, fmt.Errorf("provider openai: decode chunk: %w", err)
+		}
+		_ = emit(chat.StreamDelta{FinishReason: "error"})
+		return nil, true, nil
+	}
+	return &chunk, false, nil
+}
+
+// applyOpenAIChoice folds one chunk's first choice into text deltas, pending
+// tool calls, and the terminal finish chunk. done is true when a finish
+// reason ended the stream.
+func applyOpenAIChoice(chunk *openAIStreamChunk, st *openAIStreamState, emit chat.StreamFunc) (bool, error) {
+	if len(chunk.Choices) == 0 {
+		return false, nil
+	}
+	choice := chunk.Choices[0]
+
+	if err := emitOpenAIContent(choice, st, emit); err != nil {
+		return false, err
+	}
+	accumulateOpenAIReasoning(choice, st)
+	accumulateOpenAIToolCalls(choice, st)
+
+	if choice.FinishReason == "" {
+		return false, nil
+	}
+	emitOpenAIFinish(chunk, choice, st, emit)
+	return true, nil
+}
+
+// emitOpenAIContent emits one text delta and marks content delivered.
+func emitOpenAIContent(choice openAIStreamChoice, st *openAIStreamState, emit chat.StreamFunc) error {
+	if choice.Delta.Content == "" {
+		return nil
+	}
+	st.emitted = true
+	return emit(chat.StreamDelta{Delta: choice.Delta.Content})
+}
+
+// accumulateOpenAIReasoning appends reasoning_content to the stream-global
+// buffer.
+func accumulateOpenAIReasoning(choice openAIStreamChoice, st *openAIStreamState) {
+	if choice.Delta.ReasoningContent != "" {
+		st.reasoning.WriteString(choice.Delta.ReasoningContent)
+	}
+}
+
+// accumulateOpenAIToolCalls merges tool-call deltas into the accumulators.
+func accumulateOpenAIToolCalls(choice openAIStreamChoice, st *openAIStreamState) {
+	for _, tc := range choice.Delta.ToolCalls {
+		accumulateOpenAIToolCall(tc, st)
+	}
+}
+
+// accumulateOpenAIToolCall merges one tool-call delta fragment.
+func accumulateOpenAIToolCall(tc openAIStreamToolCall, st *openAIStreamState) {
+	a := st.acc[tc.Index]
+	if a == nil {
+		a = &toolCallAccum{}
+		st.acc[tc.Index] = a
+	}
+	if tc.ID != "" {
+		a.id = tc.ID
+	}
+	if tc.Function.Name != "" {
+		a.name = tc.Function.Name
+	}
+	if tc.Function.Arguments != "" {
+		a.args.WriteString(tc.Function.Arguments)
+	}
+}
+
+// emitOpenAIFinish emits the terminal chunk carrying the finish reason, any
+// usage, pending tool calls, and accumulated reasoning.
+func emitOpenAIFinish(chunk *openAIStreamChunk, choice openAIStreamChoice, st *openAIStreamState, emit chat.StreamFunc) {
+	var usage *chat.Usage
+	if chunk.Usage != nil {
+		u := mapUsage(*chunk.Usage)
+		usage = &u
+	}
+	_ = emit(buildToolCallDelta(choice.FinishReason, usage, st.acc, st.reasoning.String()))
+}
+
+// handleOpenAIScanError maps a scanner failure to an emitted error delta
+// (after content) or a returned error (before any content).
+func handleOpenAIScanError(err error, st *openAIStreamState, emit chat.StreamFunc) error {
+	if !st.emitted {
+		return fmt.Errorf("provider openai: read stream: %w", err)
+	}
+	_ = emit(chat.StreamDelta{FinishReason: "error"})
+	return nil
+}
+
+// finishOpenAIStream emits the closing chunk when the stream ends without an
+// explicit finish chunk.
+func finishOpenAIStream(st *openAIStreamState, emit chat.StreamFunc) error {
 	// Stream ended without an explicit finish chunk.
-	if !emitted && len(acc) == 0 {
+	if !st.emitted && len(st.acc) == 0 {
 		return fmt.Errorf("provider openai: stream ended without content")
 	}
-	_ = emit(buildToolCallDelta("stop", nil, acc, reasoning.String()))
+	_ = emit(buildToolCallDelta("stop", nil, st.acc, st.reasoning.String()))
 	return nil
 }
 

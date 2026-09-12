@@ -196,8 +196,8 @@ func (c *Config) Addr() string {
 // "round_robin", a provider has a non-empty Timeout that fails to parse, or
 // server.port is set to a value outside 1-65535.
 func (c *Config) Validate() error {
-	if c.Server.Port != 0 && (c.Server.Port < 1 || c.Server.Port > 65535) {
-		return fmt.Errorf("config: server.port must be 1-65535, got %d", c.Server.Port)
+	if err := c.validateServer(); err != nil {
+		return err
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("config: at least one provider is required")
@@ -206,50 +206,118 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: at least one model is required")
 	}
 
+	known, err := c.validateProviders()
+	if err != nil {
+		return err
+	}
+	if err := c.validateMCPServers(); err != nil {
+		return err
+	}
+	return c.validateModels(known)
+}
+
+// validateServer checks the server section.
+func (c *Config) validateServer() error {
+	if c.Server.Port == 0 {
+		return nil
+	}
+	if c.Server.Port < 1 || c.Server.Port > 65535 {
+		return fmt.Errorf("config: server.port must be 1-65535, got %d", c.Server.Port)
+	}
+	return nil
+}
+
+// validateProviders checks each provider entry and returns the set of known
+// provider names for candidate resolution.
+func (c *Config) validateProviders() (map[string]bool, error) {
 	known := make(map[string]bool, len(c.Providers))
 	for _, p := range c.Providers {
-		if p.Name == "" {
-			return fmt.Errorf("config: provider with empty name")
-		}
-		if _, err := p.TimeoutDuration(); err != nil {
-			return err
+		if err := validateProvider(p); err != nil {
+			return nil, err
 		}
 		known[p.Name] = true
 	}
+	return known, nil
+}
 
+// validateProvider checks a single provider entry.
+func validateProvider(p ProviderConfig) error {
+	if p.Name == "" {
+		return fmt.Errorf("config: provider with empty name")
+	}
+	if _, err := p.TimeoutDuration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateMCPServers checks each MCP server entry.
+func (c *Config) validateMCPServers() error {
 	for _, s := range c.MCP.Servers {
-		if s.Name == "" {
-			return fmt.Errorf("config: mcp server with empty name")
-		}
-		if s.URL == "" {
-			return fmt.Errorf("config: mcp server %q has empty url", s.Name)
-		}
-		switch s.TransportOrDefault() {
-		case "streamable", "sse":
-		default:
-			return fmt.Errorf("config: mcp server %q has unsupported transport %q (want \"streamable\" or \"sse\")", s.Name, s.Transport)
-		}
-		if _, err := s.TimeoutDuration(); err != nil {
+		if err := validateMCPServer(s); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
+// validateMCPServer checks a single MCP server entry.
+func validateMCPServer(s MCPServer) error {
+	if s.Name == "" {
+		return fmt.Errorf("config: mcp server with empty name")
+	}
+	if s.URL == "" {
+		return fmt.Errorf("config: mcp server %q has empty url", s.Name)
+	}
+	if !validMCPTransport(s.TransportOrDefault()) {
+		return fmt.Errorf("config: mcp server %q has unsupported transport %q (want \"streamable\" or \"sse\")", s.Name, s.Transport)
+	}
+	if _, err := s.TimeoutDuration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validMCPTransport reports whether t is a supported MCP transport.
+func validMCPTransport(t string) bool {
+	return t == "streamable" || t == "sse"
+}
+
+// validateModels checks each model entry, resolving candidates against the
+// known provider names.
+func (c *Config) validateModels(known map[string]bool) error {
 	for _, m := range c.Models {
-		if m.Name == "" {
-			return fmt.Errorf("config: model with empty name")
-		}
-		switch m.Strategy {
-		case "failover", "round_robin":
-		default:
-			return fmt.Errorf("config: model %q has unsupported strategy %q (want \"failover\" or \"round_robin\")", m.Name, m.Strategy)
-		}
-		if _, err := m.CooldownDuration(); err != nil {
+		if err := validateModel(m, known); err != nil {
 			return err
 		}
-		for _, cand := range m.Candidates {
-			if !known[cand.Provider] {
-				return fmt.Errorf("config: model %q references unknown provider %q", m.Name, cand.Provider)
-			}
+	}
+	return nil
+}
+
+// validateModel checks a single model entry.
+func validateModel(m ModelConfig, known map[string]bool) error {
+	if m.Name == "" {
+		return fmt.Errorf("config: model with empty name")
+	}
+	if !validModelStrategy(m.Strategy) {
+		return fmt.Errorf("config: model %q has unsupported strategy %q (want \"failover\" or \"round_robin\")", m.Name, m.Strategy)
+	}
+	if _, err := m.CooldownDuration(); err != nil {
+		return err
+	}
+	return validateCandidates(m, known)
+}
+
+// validModelStrategy reports whether s is a supported routing strategy.
+func validModelStrategy(s string) bool {
+	return s == "failover" || s == "round_robin"
+}
+
+// validateCandidates checks that every candidate references a known provider.
+func validateCandidates(m ModelConfig, known map[string]bool) error {
+	for _, cand := range m.Candidates {
+		if !known[cand.Provider] {
+			return fmt.Errorf("config: model %q references unknown provider %q", m.Name, cand.Provider)
 		}
 	}
 	return nil

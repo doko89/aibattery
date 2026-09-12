@@ -13,6 +13,9 @@ import (
 	"sync"
 )
 
+// headerMcpSessionID is the session header advertised by MCP SSE servers.
+const headerMcpSessionID = "Mcp-Session-Id"
+
 // SSETransport implements the legacy SSE transport: it opens a GET stream to
 // discover the POST endpoint (via an `event: endpoint` frame), then POSTs
 // JSON-RPC messages to that endpoint.
@@ -44,7 +47,7 @@ func (t *SSETransport) Connect(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+	if sid := resp.Header.Get(headerMcpSessionID); sid != "" {
 		t.mu.Lock()
 		t.sessionID = sid
 		t.mu.Unlock()
@@ -126,7 +129,7 @@ func (t *SSETransport) Do(ctx context.Context, req RequestMessage, expectsRespon
 		httpReq.Header.Set("Authorization", "Bearer "+t.bearerToken)
 	}
 	if sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", sessionID)
+		httpReq.Header.Set(headerMcpSessionID, sessionID)
 	}
 
 	resp, err := t.client.Do(httpReq)
@@ -135,7 +138,7 @@ func (t *SSETransport) Do(ctx context.Context, req RequestMessage, expectsRespon
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+	if sid := resp.Header.Get(headerMcpSessionID); sid != "" {
 		t.mu.Lock()
 		t.sessionID = sid
 		t.mu.Unlock()

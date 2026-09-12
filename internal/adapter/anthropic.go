@@ -157,14 +157,9 @@ type streamToolBlock struct {
 // buildRequest translates a canonical ChatRequest into the Anthropic wire
 // shape.
 func buildAnthropicRequest(req chat.ChatRequest) anthropicRequest {
-	maxTokens := 1024
-	if req.MaxTokens != nil {
-		maxTokens = *req.MaxTokens
-	}
-
 	out := anthropicRequest{
 		Model:     req.Model,
-		MaxTokens: maxTokens,
+		MaxTokens: anthropicMaxTokens(req),
 		Stream:    req.Stream,
 		System:    req.System,
 		Messages:  make([]anthropicMessage, 0, len(req.Messages)),
@@ -174,70 +169,123 @@ func buildAnthropicRequest(req chat.ChatRequest) anthropicRequest {
 		out.Temperature = req.Temperature
 	}
 
-	if req.ReasoningEffort != nil {
-		out.Thinking = anthropicThinkingFor(*req.ReasoningEffort, req.Model)
-		// budget_tokens counts toward max_tokens; Anthropic rejects a budget
-		// >= max_tokens, so raise max_tokens above the budget when needed.
-		if out.Thinking.Type == "enabled" && out.MaxTokens <= out.Thinking.BudgetTokens {
-			out.MaxTokens = out.Thinking.BudgetTokens + 1
-		}
-	}
+	applyAnthropicThinking(req, &out)
 
 	if len(req.Tools) > 0 {
-		out.Tools = make([]anthropicTool, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			schema := t.InputSchema
-			if schema == nil {
-				schema = map[string]any{"type": "object"}
-			}
-			out.Tools = append(out.Tools, anthropicTool{
-				Name:        t.Name,
-				Description: t.Description,
-				InputSchema: schema,
-			})
-		}
+		out.Tools = anthropicTools(req.Tools)
 	}
 
-	for _, m := range req.Messages {
-		role := anthropicRole(m.Role)
-		if role == "" {
+	out.Messages = anthropicMessages(req.Messages)
+
+	return out
+}
+
+// anthropicMaxTokens resolves the effective max_tokens (default 1024).
+func anthropicMaxTokens(req chat.ChatRequest) int {
+	if req.MaxTokens != nil {
+		return *req.MaxTokens
+	}
+	return 1024
+}
+
+// applyAnthropicThinking sets the thinking parameter and bumps max_tokens
+// above the thinking budget when Anthropic would reject budget >= max_tokens.
+func applyAnthropicThinking(req chat.ChatRequest, out *anthropicRequest) {
+	if req.ReasoningEffort == nil {
+		return
+	}
+	out.Thinking = anthropicThinkingFor(*req.ReasoningEffort, req.Model)
+	// budget_tokens counts toward max_tokens; Anthropic rejects a budget
+	// >= max_tokens, so raise max_tokens above the budget when needed.
+	if out.Thinking.Type == "enabled" && out.MaxTokens <= out.Thinking.BudgetTokens {
+		out.MaxTokens = out.Thinking.BudgetTokens + 1
+	}
+}
+
+// anthropicTools converts canonical tool definitions to the Anthropic wire
+// shape.
+func anthropicTools(tools []chat.Tool) []anthropicTool {
+	out := make([]anthropicTool, 0, len(tools))
+	for _, t := range tools {
+		schema := t.InputSchema
+		if schema == nil {
+			schema = map[string]any{"type": "object"}
+		}
+		out = append(out, anthropicTool{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: schema,
+		})
+	}
+	return out
+}
+
+// anthropicMessages converts canonical messages, skipping roles Anthropic
+// does not accept inside messages (system is promoted to top-level).
+func anthropicMessages(messages []chat.Message) []anthropicMessage {
+	out := make([]anthropicMessage, 0, len(messages))
+	for _, m := range messages {
+		wire, ok := anthropicMessageFor(m)
+		if !ok {
 			// RoleSystem is promoted to the top-level "system" field and is
 			// not a valid member of the messages array.
 			continue
 		}
-		wire := anthropicMessage{Role: role}
-		switch {
-		case m.Role == chat.Role("tool"):
-			wire.Content = []anthropicBlock{{
-				Type:      "tool_result",
-				ToolUseID: m.ToolCallID,
-				Content:   m.Content,
-			}}
-		case len(m.ToolCalls) > 0:
-			blocks := make([]anthropicBlock, 0, len(m.ToolCalls)+1)
-			if m.Content != "" {
-				blocks = append(blocks, anthropicBlock{Type: "text", Text: m.Content})
-			}
-			for _, tc := range m.ToolCalls {
-				var input map[string]any
-				if err := json.Unmarshal(tc.Arguments, &input); err != nil || input == nil {
-					input = map[string]any{}
-				}
-				blocks = append(blocks, anthropicBlock{
-					Type:  "tool_use",
-					ID:    tc.ID,
-					Name:  tc.Name,
-					Input: &input,
-				})
-			}
-			wire.Content = blocks
-		default:
-			wire.Content = m.Content
-		}
-		out.Messages = append(out.Messages, wire)
+		out = append(out, wire)
 	}
-
 	return out
+}
+
+// anthropicMessageFor converts one canonical message; ok is false when the
+// role has no Anthropic messages-array representation.
+func anthropicMessageFor(m chat.Message) (anthropicMessage, bool) {
+	role := anthropicRole(m.Role)
+	if role == "" {
+		return anthropicMessage{}, false
+	}
+	wire := anthropicMessage{Role: role}
+	switch {
+	case m.Role == chat.Role("tool"):
+		wire.Content = []anthropicBlock{{
+			Type:      "tool_result",
+			ToolUseID: m.ToolCallID,
+			Content:   m.Content,
+		}}
+	case len(m.ToolCalls) > 0:
+		wire.Content = anthropicToolUseBlocks(m)
+	default:
+		wire.Content = m.Content
+	}
+	return wire, true
+}
+
+// anthropicToolUseBlocks builds the text + tool_use blocks for an assistant
+// message carrying tool calls.
+func anthropicToolUseBlocks(m chat.Message) []anthropicBlock {
+	blocks := make([]anthropicBlock, 0, len(m.ToolCalls)+1)
+	if m.Content != "" {
+		blocks = append(blocks, anthropicBlock{Type: "text", Text: m.Content})
+	}
+	for _, tc := range m.ToolCalls {
+		input := anthropicToolInput(tc.Arguments)
+		blocks = append(blocks, anthropicBlock{
+			Type:  "tool_use",
+			ID:    tc.ID,
+			Name:  tc.Name,
+			Input: &input,
+		})
+	}
+	return blocks
+}
+
+// anthropicToolInput decodes raw tool arguments; invalid or null input falls
+// back to an empty object so the wire never carries a bad payload.
+func anthropicToolInput(raw json.RawMessage) map[string]any {
+	var input map[string]any
+	if err := json.Unmarshal(raw, &input); err != nil || input == nil {
+		return map[string]any{}
+	}
+	return input
 }
 
 // anthropicThinkingFor maps a canonical reasoning effort to the Anthropic
@@ -421,15 +469,18 @@ func (p *anthropicProvider) Stream(ctx context.Context, req chat.ChatRequest, em
 	return p.consumeStream(resp.Body, emit)
 }
 
+// anthropicStreamState accumulates streaming progress across SSE frames.
+type anthropicStreamState struct {
+	delivered    bool
+	inputTokens  int
+	outputTokens int
+	stopReason   string
+	toolBlocks   map[int]*streamToolBlock
+}
+
 // consumeStream parses the SSE frame stream and drives emit.
 func (p *anthropicProvider) consumeStream(r io.Reader, emit chat.StreamFunc) error {
-	var (
-		delivered    bool
-		inputTokens  int
-		outputTokens int
-		stopReason   string
-		toolBlocks   map[int]*streamToolBlock
-	)
+	st := &anthropicStreamState{}
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -440,118 +491,26 @@ func (p *anthropicProvider) consumeStream(r io.Reader, emit chat.StreamFunc) err
 	)
 
 	flush := func() error {
-		if len(dataLines) == 0 {
+		payload, ok := anthropicFramePayload(&dataLines)
+		if !ok {
 			return nil
 		}
-		payload := strings.Join(dataLines, "\n")
-		dataLines = dataLines[:0]
-
-		var ev anthropicStreamEvent
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		ev, ok := anthropicParseEvent(payload)
+		if !ok {
 			// Ignore malformed frames; keep streaming.
 			return nil
 		}
-
-		switch eventName {
-		case "message_start":
-			if ev.Message != nil {
-				inputTokens = ev.Message.Usage.InputTokens
-			}
-		case "content_block_start":
-			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" && ev.Index != nil {
-				if toolBlocks == nil {
-					toolBlocks = make(map[int]*streamToolBlock)
-				}
-				toolBlocks[*ev.Index] = &streamToolBlock{
-					id:   ev.ContentBlock.ID,
-					name: ev.ContentBlock.Name,
-				}
-				delivered = true
-			}
-		case "content_block_delta":
-			if ev.Delta == nil {
-				return nil
-			}
-			switch ev.Delta.Type {
-			case "text_delta":
-				delivered = true
-				if err := emit(chat.StreamDelta{Delta: ev.Delta.Text}); err != nil {
-					return err
-				}
-			case "input_json_delta":
-				if ev.Index != nil {
-					if tb, ok := toolBlocks[*ev.Index]; ok {
-						tb.sb.WriteString(ev.Delta.PartialJSON)
-					}
-				}
-			}
-		case "message_delta":
-			if ev.Delta != nil {
-				stopReason = ev.Delta.StopReason
-			}
-			if ev.Usage != nil {
-				outputTokens = ev.Usage.OutputTokens
-			}
-		case "message_stop":
-			usage := &chat.Usage{
-				PromptTokens:     inputTokens,
-				CompletionTokens: outputTokens,
-				TotalTokens:      inputTokens + outputTokens,
-			}
-			if len(toolBlocks) > 0 {
-				calls := make([]chat.ToolCall, 0, len(toolBlocks))
-				for _, tb := range toolBlocks {
-					raw := tb.sb.String()
-					if raw == "" {
-						raw = "{}"
-					}
-					calls = append(calls, chat.ToolCall{
-						ID:        tb.id,
-						Name:      tb.name,
-						Arguments: json.RawMessage(raw),
-					})
-				}
-				return emit(chat.StreamDelta{
-					FinishReason: "tool_calls",
-					Usage:        usage,
-					ToolCalls:    calls,
-				})
-			}
-			return emit(chat.StreamDelta{
-				FinishReason: anthropicFinishReason(stopReason),
-				Usage:        usage,
-			})
-		case "error":
-			if delivered {
-				return emit(chat.StreamDelta{FinishReason: "error"})
-			}
-			msg := "anthropic: stream error"
-			if ev.Error != nil && ev.Error.Message != "" {
-				msg = "anthropic: stream error: " + ev.Error.Message
-			}
-			return fmt.Errorf("%s", msg)
-		}
-		return nil
+		return handleAnthropicStreamEvent(eventName, ev, st, emit)
 	}
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			if err := flush(); err != nil {
-				return err
-			}
-			eventName = ""
+		if anthropicProcessLine(scanner.Text(), &eventName, &dataLines) {
 			continue
 		}
-		if strings.HasPrefix(line, "event:") {
-			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
+		if err := flush(); err != nil {
+			return err
 		}
-		if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-			continue
-		}
-		// Ignore comments and other SSE fields.
+		eventName = ""
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -565,10 +524,183 @@ func (p *anthropicProvider) consumeStream(r io.Reader, emit chat.StreamFunc) err
 	}
 
 	// Stream ended without a message_stop event.
-	if !delivered {
+	if !st.delivered {
 		return fmt.Errorf("anthropic: stream ended before any content")
 	}
 	return nil
+}
+
+// anthropicFramePayload joins pending data lines into one payload and clears
+// them. ok is false when there is no pending frame.
+func anthropicFramePayload(dataLines *[]string) (string, bool) {
+	if len(*dataLines) == 0 {
+		return "", false
+	}
+	payload := strings.Join(*dataLines, "\n")
+	*dataLines = (*dataLines)[:0]
+	return payload, true
+}
+
+// anthropicParseEvent decodes one SSE payload; ok is false on malformed JSON.
+func anthropicParseEvent(payload string) (anthropicStreamEvent, bool) {
+	var ev anthropicStreamEvent
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		return anthropicStreamEvent{}, false
+	}
+	return ev, true
+}
+
+// anthropicProcessLine routes one scanner line into the SSE frame being
+// built. It returns true when the scan loop should continue without flushing
+// (non-blank line); blank lines return false so the caller flushes.
+func anthropicProcessLine(line string, eventName *string, dataLines *[]string) bool {
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "event:") {
+		*eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		return true
+	}
+	if strings.HasPrefix(line, "data:") {
+		*dataLines = append(*dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		return true
+	}
+	// Ignore comments and other SSE fields.
+	return true
+}
+
+// handleAnthropicStreamEvent dispatches one decoded SSE event.
+func handleAnthropicStreamEvent(eventName string, ev anthropicStreamEvent, st *anthropicStreamState, emit chat.StreamFunc) error {
+	switch eventName {
+	case "message_start":
+		handleAnthropicMessageStart(ev, st)
+	case "content_block_start":
+		handleAnthropicBlockStart(ev, st)
+	case "content_block_delta":
+		return handleAnthropicBlockDelta(ev, st, emit)
+	case "message_delta":
+		handleAnthropicMessageDelta(ev, st)
+	case "message_stop":
+		return handleAnthropicMessageStop(st, emit)
+	case "error":
+		return handleAnthropicStreamError(ev, st, emit)
+	}
+	return nil
+}
+
+// handleAnthropicMessageStart records usage.input_tokens from message_start.
+func handleAnthropicMessageStart(ev anthropicStreamEvent, st *anthropicStreamState) {
+	if ev.Message != nil {
+		st.inputTokens = ev.Message.Usage.InputTokens
+	}
+}
+
+// handleAnthropicBlockStart registers a streaming tool_use block header.
+func handleAnthropicBlockStart(ev anthropicStreamEvent, st *anthropicStreamState) {
+	if ev.ContentBlock == nil || ev.ContentBlock.Type != "tool_use" || ev.Index == nil {
+		return
+	}
+	if st.toolBlocks == nil {
+		st.toolBlocks = make(map[int]*streamToolBlock)
+	}
+	st.toolBlocks[*ev.Index] = &streamToolBlock{
+		id:   ev.ContentBlock.ID,
+		name: ev.ContentBlock.Name,
+	}
+	st.delivered = true
+}
+
+// handleAnthropicBlockDelta handles text and input_json deltas.
+func handleAnthropicBlockDelta(ev anthropicStreamEvent, st *anthropicStreamState, emit chat.StreamFunc) error {
+	if ev.Delta == nil {
+		return nil
+	}
+	switch ev.Delta.Type {
+	case "text_delta":
+		return emitAnthropicTextDelta(ev, st, emit)
+	case "input_json_delta":
+		appendAnthropicPartialJSON(ev, st)
+	}
+	return nil
+}
+
+// emitAnthropicTextDelta emits one text delta and marks content delivered.
+func emitAnthropicTextDelta(ev anthropicStreamEvent, st *anthropicStreamState, emit chat.StreamFunc) error {
+	st.delivered = true
+	return emit(chat.StreamDelta{Delta: ev.Delta.Text})
+}
+
+// appendAnthropicPartialJSON appends an input_json fragment to its tool block.
+func appendAnthropicPartialJSON(ev anthropicStreamEvent, st *anthropicStreamState) {
+	if ev.Index == nil {
+		return
+	}
+	tb, ok := st.toolBlocks[*ev.Index]
+	if !ok {
+		return
+	}
+	tb.sb.WriteString(ev.Delta.PartialJSON)
+}
+
+// handleAnthropicMessageDelta records the stop reason and output tokens.
+func handleAnthropicMessageDelta(ev anthropicStreamEvent, st *anthropicStreamState) {
+	if ev.Delta != nil {
+		st.stopReason = ev.Delta.StopReason
+	}
+	if ev.Usage != nil {
+		st.outputTokens = ev.Usage.OutputTokens
+	}
+}
+
+// handleAnthropicMessageStop emits the final chunk with finish reason, usage,
+// and any accumulated tool calls.
+func handleAnthropicMessageStop(st *anthropicStreamState, emit chat.StreamFunc) error {
+	usage := &chat.Usage{
+		PromptTokens:     st.inputTokens,
+		CompletionTokens: st.outputTokens,
+		TotalTokens:      st.inputTokens + st.outputTokens,
+	}
+	if len(st.toolBlocks) > 0 {
+		return emit(chat.StreamDelta{
+			FinishReason: "tool_calls",
+			Usage:        usage,
+			ToolCalls:    anthropicStreamToolCalls(st.toolBlocks),
+		})
+	}
+	return emit(chat.StreamDelta{
+		FinishReason: anthropicFinishReason(st.stopReason),
+		Usage:        usage,
+	})
+}
+
+// anthropicStreamToolCalls materializes accumulated tool blocks.
+func anthropicStreamToolCalls(toolBlocks map[int]*streamToolBlock) []chat.ToolCall {
+	calls := make([]chat.ToolCall, 0, len(toolBlocks))
+	for _, tb := range toolBlocks {
+		raw := tb.sb.String()
+		if raw == "" {
+			raw = "{}"
+		}
+		calls = append(calls, chat.ToolCall{
+			ID:        tb.id,
+			Name:      tb.name,
+			Arguments: json.RawMessage(raw),
+		})
+	}
+	return calls
+}
+
+// handleAnthropicStreamError maps an error event to an emitted error delta
+// (after content) or a returned error (before any content).
+func handleAnthropicStreamError(ev anthropicStreamEvent, st *anthropicStreamState, emit chat.StreamFunc) error {
+	if st.delivered {
+		return emit(chat.StreamDelta{FinishReason: "error"})
+	}
+	msg := "anthropic: stream error"
+	if ev.Error != nil && ev.Error.Message != "" {
+		msg = "anthropic: stream error: " + ev.Error.Message
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 // ---- helpers ----------------------------------------------------------------

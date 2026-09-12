@@ -68,7 +68,13 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
-	// Headers.
+	assertAnthropicHeaders(t, gotHeaders)
+	assertAnthropicTranslationBody(t, got)
+	assertAnthropicTranslationResponse(t, resp)
+}
+
+func assertAnthropicHeaders(t *testing.T, gotHeaders http.Header) {
+	t.Helper()
 	if gotHeaders.Get("x-api-key") != "test-key" {
 		t.Errorf("x-api-key = %q", gotHeaders.Get("x-api-key"))
 	}
@@ -78,14 +84,21 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 	if gotHeaders.Get("Content-Type") != "application/json" {
 		t.Errorf("Content-Type = %q", gotHeaders.Get("Content-Type"))
 	}
+}
 
-	// Request body translation.
+func assertAnthropicTranslationBody(t *testing.T, got anthropicCaptureRequest) {
+	t.Helper()
 	if got.Model != "claude-sonnet-4-6" {
 		t.Errorf("model = %q", got.Model)
 	}
 	if got.MaxTokens != 1024 {
 		t.Errorf("max_tokens default = %d, want 1024", got.MaxTokens)
 	}
+	checkAnthropicSystemAndTemp(t, got)
+}
+
+func checkAnthropicSystemAndTemp(t *testing.T, got anthropicCaptureRequest) {
+	t.Helper()
 	if got.System != "You are helpful." {
 		t.Errorf("system = %q", got.System)
 	}
@@ -95,7 +108,13 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 	if got.Stream {
 		t.Error("stream should be false for Complete")
 	}
-	// RoleSystem dropped, only user+assistant remain.
+	checkAnthropicRolesDropped(t, got)
+}
+
+// checkAnthropicRolesDropped verifies RoleSystem was dropped and only
+// user+assistant remain.
+func checkAnthropicRolesDropped(t *testing.T, got anthropicCaptureRequest) {
+	t.Helper()
 	if len(got.Messages) != 2 {
 		t.Fatalf("messages len = %d, want 2", len(got.Messages))
 	}
@@ -105,14 +124,21 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 	if got.Messages[1].Role != "assistant" || got.Messages[1].Content != "Hello" {
 		t.Errorf("messages[1] = %+v", got.Messages[1])
 	}
+}
 
-	// Response extraction.
+func assertAnthropicTranslationResponse(t *testing.T, resp chat.ChatResponse) {
+	t.Helper()
 	if resp.ID != "msg_123" {
 		t.Errorf("id = %q", resp.ID)
 	}
 	if resp.Content != "Hello world" {
 		t.Errorf("content = %q", resp.Content)
 	}
+	checkAnthropicFinishAndUsage(t, resp)
+}
+
+func checkAnthropicFinishAndUsage(t *testing.T, resp chat.ChatResponse) {
+	t.Helper()
 	if resp.FinishReason != "stop" {
 		t.Errorf("finish_reason = %q, want stop", resp.FinishReason)
 	}
@@ -142,16 +168,19 @@ func TestAnthropicComplete_RateLimit429(t *testing.T) {
 	}
 }
 
+// anthropicThinkingCase is one row of the thinking-config matrix.
+type anthropicThinkingCase struct {
+	name       string
+	model      string
+	effort     *string
+	wantType   string
+	wantBudget int
+	wantMax    int
+	wantAbsent bool
+}
+
 func TestAnthropicComplete_Thinking(t *testing.T) {
-	tests := []struct {
-		name       string
-		model      string
-		effort     *string
-		wantType   string
-		wantBudget int
-		wantMax    int
-		wantAbsent bool
-	}{
+	tests := []anthropicThinkingCase{
 		{name: "legacy enabled with budget", model: "claude-sonnet-4-5", effort: strPtr("high"), wantType: "enabled", wantBudget: 16000, wantMax: 16001},
 		{name: "modern adaptive", model: "claude-sonnet-4-6", effort: strPtr("high"), wantType: "adaptive", wantMax: 1024},
 		{name: "disabled", model: "claude-sonnet-4-6", effort: strPtr("none"), wantType: "disabled", wantMax: 1024},
@@ -160,40 +189,65 @@ func TestAnthropicComplete_Thinking(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var got anthropicCaptureRequest
-			srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-				_ = json.NewDecoder(r.Body).Decode(&got)
-				_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
-			})
-			defer srv.Close()
-
-			_, err := p.Complete(context.Background(), chat.ChatRequest{
-				Model:           tt.model,
-				ReasoningEffort: tt.effort,
-				Messages:        []chat.Message{{Role: chat.RoleUser, Content: "x"}},
-			})
-			if err != nil {
-				t.Fatalf("Complete: %v", err)
-			}
-			if tt.wantAbsent {
-				if got.Thinking != nil {
-					t.Errorf("thinking = %+v, want absent", got.Thinking)
-				}
-			} else {
-				if got.Thinking == nil {
-					t.Fatal("thinking should be present")
-				}
-				if got.Thinking.Type != tt.wantType {
-					t.Errorf("thinking.type = %q, want %q", got.Thinking.Type, tt.wantType)
-				}
-				if got.Thinking.BudgetTokens != tt.wantBudget {
-					t.Errorf("thinking.budget_tokens = %d, want %d", got.Thinking.BudgetTokens, tt.wantBudget)
-				}
-			}
-			if got.MaxTokens != tt.wantMax {
-				t.Errorf("max_tokens = %d, want %d", got.MaxTokens, tt.wantMax)
-			}
+			runAnthropicThinkingCase(t, tt)
 		})
+	}
+}
+
+func runAnthropicThinkingCase(t *testing.T, tt anthropicThinkingCase) {
+	t.Helper()
+	var got anthropicCaptureRequest
+	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	defer srv.Close()
+
+	_, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model:           tt.model,
+		ReasoningEffort: tt.effort,
+		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "x"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	assertAnthropicThinking(t, got, tt)
+}
+
+func assertAnthropicThinking(t *testing.T, got anthropicCaptureRequest, tt anthropicThinkingCase) {
+	t.Helper()
+	if tt.wantAbsent {
+		checkAnthropicThinkingAbsent(t, got)
+	} else {
+		checkAnthropicThinkingPresent(t, got, tt)
+	}
+	checkAnthropicThinkingMaxTokens(t, got, tt)
+}
+
+func checkAnthropicThinkingAbsent(t *testing.T, got anthropicCaptureRequest) {
+	t.Helper()
+	if got.Thinking != nil {
+		t.Errorf("thinking = %+v, want absent", got.Thinking)
+	}
+}
+
+func checkAnthropicThinkingPresent(t *testing.T, got anthropicCaptureRequest, tt anthropicThinkingCase) {
+	t.Helper()
+	if got.Thinking == nil {
+		t.Fatal("thinking should be present")
+	}
+	if got.Thinking.Type != tt.wantType {
+		t.Errorf("thinking.type = %q, want %q", got.Thinking.Type, tt.wantType)
+	}
+	if got.Thinking.BudgetTokens != tt.wantBudget {
+		t.Errorf("thinking.budget_tokens = %d, want %d", got.Thinking.BudgetTokens, tt.wantBudget)
+	}
+}
+
+func checkAnthropicThinkingMaxTokens(t *testing.T, got anthropicCaptureRequest, tt anthropicThinkingCase) {
+	t.Helper()
+	if got.MaxTokens != tt.wantMax {
+		t.Errorf("max_tokens = %d, want %d", got.MaxTokens, tt.wantMax)
 	}
 }
 

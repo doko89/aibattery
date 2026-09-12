@@ -23,10 +23,17 @@ func captureRequest(t *testing.T, r *http.Request) openAIRequest {
 	return body
 }
 
-func TestComplete_TranslationAndParsing(t *testing.T) {
-	var got openAIRequest
-	var gotAuth, gotContentType string
+// openAICapture records what a fake OpenAI upstream received.
+type openAICapture struct {
+	body        openAIRequest
+	auth        string
+	contentType string
+}
 
+// newOpenAICompleteServer starts a fake OpenAI chat-completions upstream that
+// checks path/method, records the request into cap, and replies with respBody.
+func newOpenAICompleteServer(t *testing.T, cap *openAICapture, respBody string) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
@@ -34,23 +41,107 @@ func TestComplete_TranslationAndParsing(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("unexpected method: %s", r.Method)
 		}
-		gotAuth = r.Header.Get("Authorization")
-		gotContentType = r.Header.Get("Content-Type")
-		got = captureRequest(t, r)
+		cap.auth = r.Header.Get("Authorization")
+		cap.contentType = r.Header.Get("Content-Type")
+		cap.body = captureRequest(t, r)
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{
-			"id": "chatcmpl-123",
-			"model": "gpt-4o-mini",
-			"choices": [{
-				"index": 0,
-				"message": {"role": "assistant", "content": "Hello there!"},
-				"finish_reason": "stop"
-			}],
-			"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
-		}`)
+		fmt.Fprint(w, respBody)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+const openAICompleteStub = `{
+	"id": "chatcmpl-123",
+	"model": "gpt-4o-mini",
+	"choices": [{
+		"index": 0,
+		"message": {"role": "assistant", "content": "Hello there!"},
+		"finish_reason": "stop"
+	}],
+	"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+}`
+
+func assertOpenAIHeaders(t *testing.T, cap *openAICapture) {
+	t.Helper()
+	if cap.auth != "Bearer sk-test" {
+		t.Errorf("Authorization = %q, want Bearer sk-test", cap.auth)
+	}
+	if cap.contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", cap.contentType)
+	}
+}
+
+func assertOpenAIMessages(t *testing.T, got openAIRequest) {
+	t.Helper()
+	if got.Model != "gpt-4o-mini" {
+		t.Errorf("model = %q", got.Model)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages len = %d, want 2", len(got.Messages))
+	}
+	checkOpenAIMessagePair(t, got)
+}
+
+func checkOpenAIMessagePair(t *testing.T, got openAIRequest) {
+	t.Helper()
+	if got.Messages[0].Role != "system" || got.Messages[0].Content != "You are helpful." {
+		t.Errorf("messages[0] = %+v", got.Messages[0])
+	}
+	if got.Messages[1].Role != "user" || got.Messages[1].Content != "Hi" {
+		t.Errorf("messages[1] = %+v", got.Messages[1])
+	}
+}
+
+func assertOpenAIOptionals(t *testing.T, got openAIRequest) {
+	t.Helper()
+	if got.Temperature == nil || *got.Temperature != 0.7 {
+		t.Errorf("temperature = %v, want 0.7", got.Temperature)
+	}
+	if got.MaxTokens == nil || *got.MaxTokens != 100 {
+		t.Errorf("max_tokens = %v, want 100", got.MaxTokens)
+	}
+	checkOpenAINonStreaming(t, got)
+}
+
+func checkOpenAINonStreaming(t *testing.T, got openAIRequest) {
+	t.Helper()
+	if got.Stream {
+		t.Errorf("stream should be false for non-streaming")
+	}
+	if got.ReasoningEffort != nil {
+		t.Errorf("reasoning_effort should be omitted, got %v", *got.ReasoningEffort)
+	}
+}
+
+func assertOpenAIChatResponse(t *testing.T, resp chat.ChatResponse) {
+	t.Helper()
+	if resp.ID != "chatcmpl-123" {
+		t.Errorf("ID = %q", resp.ID)
+	}
+	if resp.Model != "gpt-4o-mini" {
+		t.Errorf("Model = %q", resp.Model)
+	}
+	checkOpenAIResponseContent(t, resp)
+}
+
+func checkOpenAIResponseContent(t *testing.T, resp chat.ChatResponse) {
+	t.Helper()
+	if resp.Content != "Hello there!" {
+		t.Errorf("Content = %q", resp.Content)
+	}
+	if resp.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want stop", resp.FinishReason)
+	}
+	if resp.Usage.PromptTokens != 9 || resp.Usage.CompletionTokens != 12 || resp.Usage.TotalTokens != 21 {
+		t.Errorf("Usage = %+v", resp.Usage)
+	}
+}
+
+func TestComplete_TranslationAndParsing(t *testing.T) {
+	var cap openAICapture
+	srv := newOpenAICompleteServer(t, &cap, openAICompleteStub)
 
 	p := NewOpenAIProvider(srv.URL, "sk-test", 5*time.Second)
 	if p.Name() != "openai" {
@@ -74,65 +165,51 @@ func TestComplete_TranslationAndParsing(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
-	if gotAuth != "Bearer sk-test" {
-		t.Errorf("Authorization = %q, want Bearer sk-test", gotAuth)
-	}
-	if gotContentType != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", gotContentType)
-	}
-	if got.Model != "gpt-4o-mini" {
-		t.Errorf("model = %q", got.Model)
-	}
-	if len(got.Messages) != 2 {
-		t.Fatalf("messages len = %d, want 2", len(got.Messages))
-	}
-	if got.Messages[0].Role != "system" || got.Messages[0].Content != "You are helpful." {
-		t.Errorf("messages[0] = %+v", got.Messages[0])
-	}
-	if got.Messages[1].Role != "user" || got.Messages[1].Content != "Hi" {
-		t.Errorf("messages[1] = %+v", got.Messages[1])
-	}
-	if got.Temperature == nil || *got.Temperature != 0.7 {
-		t.Errorf("temperature = %v, want 0.7", got.Temperature)
-	}
-	if got.MaxTokens == nil || *got.MaxTokens != 100 {
-		t.Errorf("max_tokens = %v, want 100", got.MaxTokens)
-	}
-	if got.Stream {
-		t.Errorf("stream should be false for non-streaming")
-	}
-	if got.ReasoningEffort != nil {
-		t.Errorf("reasoning_effort should be omitted, got %v", *got.ReasoningEffort)
-	}
+	assertOpenAIHeaders(t, &cap)
+	assertOpenAIMessages(t, cap.body)
+	assertOpenAIOptionals(t, cap.body)
+	assertOpenAIChatResponse(t, resp)
+}
 
-	// Second request: reasoning effort set — temperature must be dropped.
+// TestComplete_ReasoningEffortDropsTemperature verifies that setting
+// reasoning effort passes it through and drops temperature.
+func TestComplete_ReasoningEffortDropsTemperature(t *testing.T) {
+	var cap openAICapture
+	srv := newOpenAICompleteServer(t, &cap, openAICompleteStub)
+
+	p := NewOpenAIProvider(srv.URL, "sk-test", 5*time.Second)
+
+	temp := 0.7
+	maxTok := 100
 	effort := "high"
-	req2 := req
-	req2.ReasoningEffort = &effort
-	if _, err := p.Complete(context.Background(), req2); err != nil {
+	req := chat.ChatRequest{
+		Model: "gpt-4o-mini",
+		Messages: []chat.Message{
+			{Role: chat.RoleSystem, Content: "You are helpful."},
+			{Role: chat.RoleUser, Content: "Hi"},
+		},
+		Temperature:     &temp,
+		MaxTokens:       &maxTok,
+		ReasoningEffort: &effort,
+	}
+	if _, err := p.Complete(context.Background(), req); err != nil {
 		t.Fatalf("Complete (reasoning): %v", err)
 	}
+	assertOpenAIReasoningEffort(t, cap.body)
+}
+
+func assertOpenAIReasoningEffort(t *testing.T, got openAIRequest) {
+	t.Helper()
 	if got.ReasoningEffort == nil || *got.ReasoningEffort != "high" {
 		t.Errorf("reasoning_effort = %v, want high", got.ReasoningEffort)
 	}
+	checkOpenAITemperatureDropped(t, got)
+}
+
+func checkOpenAITemperatureDropped(t *testing.T, got openAIRequest) {
+	t.Helper()
 	if got.Temperature != nil {
 		t.Errorf("temperature should be dropped when reasoning_effort is set, got %v", *got.Temperature)
-	}
-
-	if resp.ID != "chatcmpl-123" {
-		t.Errorf("ID = %q", resp.ID)
-	}
-	if resp.Model != "gpt-4o-mini" {
-		t.Errorf("Model = %q", resp.Model)
-	}
-	if resp.Content != "Hello there!" {
-		t.Errorf("Content = %q", resp.Content)
-	}
-	if resp.FinishReason != "stop" {
-		t.Errorf("FinishReason = %q, want stop", resp.FinishReason)
-	}
-	if resp.Usage.PromptTokens != 9 || resp.Usage.CompletionTokens != 12 || resp.Usage.TotalTokens != 21 {
-		t.Errorf("Usage = %+v", resp.Usage)
 	}
 }
 
@@ -584,84 +661,100 @@ func TestOpenAI_ReasoningContentResponse(t *testing.T) {
 	}
 }
 
+// DeepSeek streams reasoning_content fragments BEFORE the tool-call
+// deltas; the fragments must be concatenated onto the final chunk.
+const openAIReasoningToolCallsFrames = "" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ing...\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"loc\\\":\\\"Jakarta\\\"}\"}}]}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+const openAIReasoningPlainContentFrames = "" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// streamOpenAIReasoning serves frames from a fake SSE upstream and collects
+// the resulting deltas.
+func streamOpenAIReasoning(t *testing.T, frames string) []chat.StreamDelta {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, frames)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewOpenAIProvider(srv.URL, "k", time.Second)
+	var deltas []chat.StreamDelta
+	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
+		deltas = append(deltas, d)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	return deltas
+}
+
+func assertReasoningToolCallsFinal(t *testing.T, deltas []chat.StreamDelta) {
+	t.Helper()
+	if len(deltas) != 1 {
+		t.Fatalf("got %d deltas, want 1: %+v", len(deltas), deltas)
+	}
+	final := deltas[0]
+	if final.FinishReason != "tool_calls" {
+		t.Errorf("FinishReason = %q, want tool_calls", final.FinishReason)
+	}
+	checkReasoningConcatenated(t, final)
+}
+
+func checkReasoningConcatenated(t *testing.T, final chat.StreamDelta) {
+	t.Helper()
+	if final.ReasoningContent != "thinking..." {
+		t.Errorf("ReasoningContent = %q, want thinking... (concatenated fragments)", final.ReasoningContent)
+	}
+	if len(final.ToolCalls) != 1 || final.ToolCalls[0].ID != "call_1" {
+		t.Errorf("ToolCalls = %+v, want call_1", final.ToolCalls)
+	}
+}
+
+func assertReasoningPlainContent(t *testing.T, deltas []chat.StreamDelta) {
+	t.Helper()
+	// content delta is emitted as-is; reasoning lands only on the final chunk
+	if len(deltas) != 2 {
+		t.Fatalf("got %d deltas, want 2: %+v", len(deltas), deltas)
+	}
+	if deltas[0].Delta != "answer" {
+		t.Errorf("deltas[0] = %+v, want content delta", deltas[0])
+	}
+	checkReasoningOnFinalChunkOnly(t, deltas)
+}
+
+func checkReasoningOnFinalChunkOnly(t *testing.T, deltas []chat.StreamDelta) {
+	t.Helper()
+	if deltas[0].ReasoningContent != "" {
+		t.Errorf("deltas[0].ReasoningContent = %q, want empty (reasoning only on final chunk)", deltas[0].ReasoningContent)
+	}
+	final := deltas[1]
+	if final.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want stop", final.FinishReason)
+	}
+	if final.ReasoningContent != "let me think" {
+		t.Errorf("ReasoningContent = %q, want let me think", final.ReasoningContent)
+	}
+}
+
 func TestOpenAI_ReasoningContentStream(t *testing.T) {
 	t.Run("tool calls", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			// DeepSeek streams reasoning_content fragments BEFORE the tool-call
-			// deltas; the fragments must be concatenated onto the final chunk.
-			fmt.Fprint(w, ""+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n"+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ing...\"}}]}\n\n"+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"loc\\\":\\\"Jakarta\\\"}\"}}]}}]}\n\n"+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
-				"data: [DONE]\n\n",
-			)
-		}))
-		defer srv.Close()
-
-		p := NewOpenAIProvider(srv.URL, "k", time.Second)
-		var deltas []chat.StreamDelta
-		err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-			deltas = append(deltas, d)
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("Stream: %v", err)
-		}
-		if len(deltas) != 1 {
-			t.Fatalf("got %d deltas, want 1: %+v", len(deltas), deltas)
-		}
-		final := deltas[0]
-		if final.FinishReason != "tool_calls" {
-			t.Errorf("FinishReason = %q, want tool_calls", final.FinishReason)
-		}
-		if final.ReasoningContent != "thinking..." {
-			t.Errorf("ReasoningContent = %q, want thinking... (concatenated fragments)", final.ReasoningContent)
-		}
-		if len(final.ToolCalls) != 1 || final.ToolCalls[0].ID != "call_1" {
-			t.Errorf("ToolCalls = %+v, want call_1", final.ToolCalls)
-		}
+		deltas := streamOpenAIReasoning(t, openAIReasoningToolCallsFrames)
+		assertReasoningToolCallsFinal(t, deltas)
 	})
 
 	t.Run("plain content", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, ""+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n"+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n"+
-				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
-				"data: [DONE]\n\n",
-			)
-		}))
-		defer srv.Close()
-
-		p := NewOpenAIProvider(srv.URL, "k", time.Second)
-		var deltas []chat.StreamDelta
-		err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-			deltas = append(deltas, d)
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("Stream: %v", err)
-		}
-		// content delta is emitted as-is; reasoning lands only on the final chunk
-		if len(deltas) != 2 {
-			t.Fatalf("got %d deltas, want 2: %+v", len(deltas), deltas)
-		}
-		if deltas[0].Delta != "answer" {
-			t.Errorf("deltas[0] = %+v, want content delta", deltas[0])
-		}
-		if deltas[0].ReasoningContent != "" {
-			t.Errorf("deltas[0].ReasoningContent = %q, want empty (reasoning only on final chunk)", deltas[0].ReasoningContent)
-		}
-		final := deltas[1]
-		if final.FinishReason != "stop" {
-			t.Errorf("FinishReason = %q, want stop", final.FinishReason)
-		}
-		if final.ReasoningContent != "let me think" {
-			t.Errorf("ReasoningContent = %q, want let me think", final.ReasoningContent)
-		}
+		deltas := streamOpenAIReasoning(t, openAIReasoningPlainContentFrames)
+		assertReasoningPlainContent(t, deltas)
 	})
 }
 

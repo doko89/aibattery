@@ -13,129 +13,90 @@ import (
 	"github.com/aibattery/router/internal/chat"
 )
 
-// TestGeminiComplete_RequestMappingAndParsing verifies the non-streaming
-// request-body translation (contents, systemInstruction, generationConfig) and
-// the response parts[].text parsing.
-func TestGeminiComplete_RequestMappingAndParsing(t *testing.T) {
-	var gotPath, gotAuth, gotContentType string
-	var gotBodies []geminiRequest
+// geminiCapture records what a fake Gemini upstream received.
+type geminiCapture struct {
+	path        string
+	auth        string
+	contentType string
+	bodies      []geminiRequest
+}
 
+// newGeminiCaptureServer starts a fake Gemini upstream that records every
+// request into cap and replies with respBody.
+func newGeminiCaptureServer(t *testing.T, cap *geminiCapture, respBody string) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("x-goog-api-key")
-		gotContentType = r.Header.Get("Content-Type")
+		cap.path = r.URL.Path
+		cap.auth = r.Header.Get("x-goog-api-key")
+		cap.contentType = r.Header.Get("Content-Type")
 		b, _ := io.ReadAll(r.Body)
 		var body geminiRequest
 		if err := json.Unmarshal(b, &body); err != nil {
-			t.Fatalf("decode request body: %v", err)
+			t.Errorf("decode request body: %v", err)
 		}
-		gotBodies = append(gotBodies, body)
+		cap.bodies = append(cap.bodies, body)
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{
-			"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
-			"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
-			"responseId":"resp-1"
-		}`)
+		io.WriteString(w, respBody)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
-	p := NewGeminiProvider(srv.URL, "test-key", 5*time.Second)
+func assertGeminiEndpoint(t *testing.T, cap *geminiCapture, wantPath, wantAuth string) {
+	t.Helper()
+	if cap.path != wantPath {
+		t.Errorf("path = %q", cap.path)
+	}
+	if cap.auth != wantAuth {
+		t.Errorf("auth header = %q", cap.auth)
+	}
+	if cap.contentType != "application/json" {
+		t.Errorf("content-type = %q", cap.contentType)
+	}
+}
 
-	temp := 0.7
-	max := 100
-	resp, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model: "models/gemini-2.5-flash",
-		Messages: []chat.Message{
-			{Role: chat.RoleUser, Content: "hi"},
-			{Role: chat.RoleAssistant, Content: "hello"},
-			{Role: chat.RoleUser, Content: ""},
-		},
-		System:      "be concise",
-		Temperature: &temp,
-		MaxTokens:   &max,
-	})
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
+func assertGeminiContentsMapping(t *testing.T, body geminiRequest) {
+	t.Helper()
+	if len(body.Contents) != 3 {
+		t.Fatalf("contents len = %d", len(body.Contents))
 	}
+	want := []struct {
+		role string
+		text string
+	}{
+		{"user", "hi"},
+		{"model", "hello"},
+		{"user", ""},
+	}
+	for i, w := range want {
+		if body.Contents[i].Role != w.role || body.Contents[i].Parts[0].Text != w.text {
+			t.Errorf("contents[%d] = %+v", i, body.Contents[i])
+		}
+	}
+}
 
-	// Endpoint: leading "models/" stripped, :generateContent suffix.
-	if gotPath != "/models/gemini-2.5-flash:generateContent" {
-		t.Errorf("path = %q", gotPath)
+func assertGeminiSystemInstruction(t *testing.T, body geminiRequest, want string) {
+	t.Helper()
+	if body.SystemInstruction == nil || body.SystemInstruction.Parts[0].Text != want {
+		t.Errorf("systemInstruction = %+v", body.SystemInstruction)
 	}
-	if gotAuth != "test-key" {
-		t.Errorf("auth header = %q", gotAuth)
-	}
-	if gotContentType != "application/json" {
-		t.Errorf("content-type = %q", gotContentType)
-	}
+}
 
-	// contents mapping: user->user, assistant->model, empty->empty text part.
-	if len(gotBodies[0].Contents) != 3 {
-		t.Fatalf("contents len = %d", len(gotBodies[0].Contents))
-	}
-	if gotBodies[0].Contents[0].Role != "user" || gotBodies[0].Contents[0].Parts[0].Text != "hi" {
-		t.Errorf("contents[0] = %+v", gotBodies[0].Contents[0])
-	}
-	if gotBodies[0].Contents[1].Role != "model" || gotBodies[0].Contents[1].Parts[0].Text != "hello" {
-		t.Errorf("contents[1] = %+v", gotBodies[0].Contents[1])
-	}
-	if gotBodies[0].Contents[2].Role != "user" || gotBodies[0].Contents[2].Parts[0].Text != "" {
-		t.Errorf("contents[2] = %+v", gotBodies[0].Contents[2])
-	}
-
-	// systemInstruction only when System set.
-	if gotBodies[0].SystemInstruction == nil || gotBodies[0].SystemInstruction.Parts[0].Text != "be concise" {
-		t.Errorf("systemInstruction = %+v", gotBodies[0].SystemInstruction)
-	}
-
-	// generationConfig only when set.
-	if gotBodies[0].GenerationConfig == nil {
+func assertGeminiTempAndMaxTokens(t *testing.T, body geminiRequest, wantTemp float64, wantMax int) {
+	t.Helper()
+	if body.GenerationConfig == nil {
 		t.Fatal("generationConfig missing")
 	}
-	if gotBodies[0].GenerationConfig.Temperature == nil || *gotBodies[0].GenerationConfig.Temperature != 0.7 {
-		t.Errorf("temperature = %v", gotBodies[0].GenerationConfig.Temperature)
+	if body.GenerationConfig.Temperature == nil || *body.GenerationConfig.Temperature != wantTemp {
+		t.Errorf("temperature = %v", body.GenerationConfig.Temperature)
 	}
-	if gotBodies[0].GenerationConfig.MaxOutputTokens == nil || *gotBodies[0].GenerationConfig.MaxOutputTokens != 100 {
-		t.Errorf("maxOutputTokens = %v", gotBodies[0].GenerationConfig.MaxOutputTokens)
+	if body.GenerationConfig.MaxOutputTokens == nil || *body.GenerationConfig.MaxOutputTokens != wantMax {
+		t.Errorf("maxOutputTokens = %v", body.GenerationConfig.MaxOutputTokens)
 	}
+}
 
-	// thinkingConfig: Gemini 3 family maps effort to thinkingLevel and forces
-	// temperature to 1.0.
-	effort := "high"
-	if _, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model:           "gemini-3-pro",
-		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
-		Temperature:     &temp, // 0.7, must be overridden to 1.0
-		ReasoningEffort: &effort,
-	}); err != nil {
-		t.Fatalf("Complete (gemini-3-pro): %v", err)
-	}
-	g3 := gotBodies[1].GenerationConfig
-	if g3 == nil || g3.ThinkingConfig == nil || g3.ThinkingConfig.ThinkingLevel != "high" {
-		t.Errorf("gemini-3-pro thinkingConfig = %+v", g3)
-	}
-	if g3.Temperature == nil || *g3.Temperature != 1.0 {
-		t.Errorf("gemini-3-pro temperature = %v, want 1.0", g3.Temperature)
-	}
-
-	// thinkingConfig: 2.5 family maps effort to a token budget, no thinkingLevel.
-	effort2 := "medium"
-	if _, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model:           "gemini-2.5-flash",
-		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
-		ReasoningEffort: &effort2,
-	}); err != nil {
-		t.Fatalf("Complete (gemini-2.5-flash): %v", err)
-	}
-	g25 := gotBodies[2].GenerationConfig
-	if g25 == nil || g25.ThinkingConfig == nil || g25.ThinkingConfig.ThinkingBudget != 4096 {
-		t.Errorf("gemini-2.5-flash thinkingConfig = %+v", g25)
-	}
-	if g25.ThinkingConfig != nil && g25.ThinkingConfig.ThinkingLevel != "" {
-		t.Errorf("gemini-2.5-flash thinkingLevel = %q, want empty", g25.ThinkingConfig.ThinkingLevel)
-	}
-
-	// Response parsing: parts joined, finishReason mapped, usage, id.
+func assertGeminiResponseParsing(t *testing.T, resp chat.ChatResponse) {
+	t.Helper()
 	if resp.Content != "Hello world" {
 		t.Errorf("content = %q", resp.Content)
 	}
@@ -147,6 +108,125 @@ func TestGeminiComplete_RequestMappingAndParsing(t *testing.T) {
 	}
 	if resp.Usage.PromptTokens != 10 || resp.Usage.CompletionTokens != 20 || resp.Usage.TotalTokens != 30 {
 		t.Errorf("usage = %+v", resp.Usage)
+	}
+}
+
+// TestGeminiComplete_RequestMappingAndParsing verifies the non-streaming
+// request-body translation (contents, systemInstruction, generationConfig) and
+// the response parts[].text parsing.
+func TestGeminiComplete_RequestMappingAndParsing(t *testing.T) {
+	var cap geminiCapture
+	srv := newGeminiCaptureServer(t, &cap, `{
+		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
+		"responseId":"resp-1"
+	}`)
+	p := NewGeminiProvider(srv.URL, "test-key", 5*time.Second)
+
+	temp := 0.7
+	maxTokens := 100
+	resp, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model: "models/gemini-2.5-flash",
+		Messages: []chat.Message{
+			{Role: chat.RoleUser, Content: "hi"},
+			{Role: chat.RoleAssistant, Content: "hello"},
+			{Role: chat.RoleUser, Content: ""},
+		},
+		System:      "be concise",
+		Temperature: &temp,
+		MaxTokens:   &maxTokens,
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	assertGeminiEndpoint(t, &cap, "/models/gemini-2.5-flash:generateContent", "test-key")
+	assertGeminiContentsMapping(t, cap.bodies[0])
+	assertGeminiSystemInstruction(t, cap.bodies[0], "be concise")
+	assertGeminiTempAndMaxTokens(t, cap.bodies[0], 0.7, 100)
+	assertGeminiResponseParsing(t, resp)
+}
+
+// TestGeminiComplete_ThinkingLevelGemini3 verifies the Gemini 3 family maps
+// effort to thinkingLevel and forces temperature to 1.0.
+func TestGeminiComplete_ThinkingLevelGemini3(t *testing.T) {
+	var cap geminiCapture
+	srv := newGeminiCaptureServer(t, &cap, `{
+		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
+		"responseId":"resp-1"
+	}`)
+	p := NewGeminiProvider(srv.URL, "test-key", 5*time.Second)
+
+	temp := 0.7 // must be overridden to 1.0
+	effort := "high"
+	if _, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model:           "gemini-3-pro",
+		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
+		Temperature:     &temp,
+		ReasoningEffort: &effort,
+	}); err != nil {
+		t.Fatalf("Complete (gemini-3-pro): %v", err)
+	}
+	assertGeminiThinkingLevel(t, cap.bodies[0].GenerationConfig, "high")
+	assertGeminiForcedTemperature(t, cap.bodies[0].GenerationConfig, 1.0)
+}
+
+func assertGeminiThinkingLevel(t *testing.T, cfg *geminiGenConfig, want string) {
+	t.Helper()
+	if cfg == nil || cfg.ThinkingConfig == nil || cfg.ThinkingConfig.ThinkingLevel != want {
+		t.Errorf("gemini-3-pro thinkingConfig = %+v", cfg)
+	}
+}
+
+func assertGeminiForcedTemperature(t *testing.T, cfg *geminiGenConfig, want float64) {
+	t.Helper()
+	if cfg == nil {
+		t.Errorf("gemini-3-pro temperature = <nil config>, want 1.0")
+		return
+	}
+	if cfg.Temperature == nil || *cfg.Temperature != want {
+		t.Errorf("gemini-3-pro temperature = %v, want 1.0", cfg.Temperature)
+	}
+}
+
+// TestGeminiComplete_ThinkingBudget25 verifies the 2.5 family maps effort to
+// a token budget with no thinkingLevel.
+func TestGeminiComplete_ThinkingBudget25(t *testing.T) {
+	var cap geminiCapture
+	srv := newGeminiCaptureServer(t, &cap, `{
+		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
+		"responseId":"resp-1"
+	}`)
+	p := NewGeminiProvider(srv.URL, "test-key", 5*time.Second)
+
+	effort := "medium"
+	if _, err := p.Complete(context.Background(), chat.ChatRequest{
+		Model:           "gemini-2.5-flash",
+		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
+		ReasoningEffort: &effort,
+	}); err != nil {
+		t.Fatalf("Complete (gemini-2.5-flash): %v", err)
+	}
+	assertGeminiThinkingBudget(t, cap.bodies[0].GenerationConfig, 4096)
+}
+
+func assertGeminiThinkingBudget(t *testing.T, cfg *geminiGenConfig, want int) {
+	t.Helper()
+	if cfg == nil || cfg.ThinkingConfig == nil || cfg.ThinkingConfig.ThinkingBudget != want {
+		t.Errorf("gemini-2.5-flash thinkingConfig = %+v", cfg)
+	}
+	checkGeminiNoThinkingLevel(t, cfg)
+}
+
+func checkGeminiNoThinkingLevel(t *testing.T, cfg *geminiGenConfig) {
+	t.Helper()
+	if cfg == nil {
+		return
+	}
+	if cfg.ThinkingConfig != nil && cfg.ThinkingConfig.ThinkingLevel != "" {
+		t.Errorf("gemini-2.5-flash thinkingLevel = %q, want empty", cfg.ThinkingConfig.ThinkingLevel)
 	}
 }
 

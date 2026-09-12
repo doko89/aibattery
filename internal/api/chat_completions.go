@@ -81,75 +81,137 @@ func validReasoningEffort(v string) bool {
 // field; the virtual model name is preserved as the initial Model value (the
 // orchestration loop overwrites it with each concrete candidate model).
 func (s *Server) buildChatRequest(req chatCompletionRequest, session string) (chat.ChatRequest, error) {
-	var system []string
-	var messages []chat.Message
-	for _, m := range req.Messages {
-		content, err := anthropicContentText(m.Content)
-		if err != nil {
-			return chat.ChatRequest{}, err
-		}
-		if m.Role == "system" {
-			system = append(system, content)
-			continue
-		}
-		msg := chat.Message{Role: chat.Role(m.Role), Content: content, ToolCallID: m.ToolCallID, ReasoningContent: m.ReasoningContent}
-		if len(m.ToolCalls) > 0 {
-			msg.ToolCalls = make([]chat.ToolCall, 0, len(m.ToolCalls))
-			for _, tc := range m.ToolCalls {
-				call := chat.ToolCall{ID: tc.ID, Name: tc.Function.Name}
-				if tc.Function.Arguments != "" && json.Valid([]byte(tc.Function.Arguments)) {
-					call.Arguments = json.RawMessage(tc.Function.Arguments)
-				}
-				msg.ToolCalls = append(msg.ToolCalls, call)
-			}
-		}
-		// Clients (OpenCode/OpenAI SDKs) never send reasoning_content back; echo
-		// the value captured from the upstream response that produced these tool
-		// calls, keyed by the first call's ID, or thinking-mode upstreams reject
-		// the turn (DeepSeek 400 "reasoning_content must be passed back"). When
-		// the cache has nothing (calls produced by a non-thinking provider, e.g.
-		// GLM without thinking enabled), a placeholder keeps the turn routable.
-		if m.Role == "assistant" && len(msg.ToolCalls) > 0 && msg.ReasoningContent == "" {
-			id := msg.ToolCalls[0].ID
-			if r := reasoningByCallID.lookup(session, id); r != "" {
-				msg.ReasoningContent = r
-				s.deps.Logger.Debug("reasoning echo",
-					"session", session, "call_id", id, "found", true)
-			} else {
-				msg.ReasoningContent = reasoningPlaceholder
-				s.deps.Logger.Debug("reasoning echo",
-					"session", session, "call_id", id, "found", false, "injected", true)
-			}
-		}
-		messages = append(messages, msg)
-	}
-
-	var maxTokens *int
-	if req.MaxTokens != nil {
-		v := *req.MaxTokens
-		maxTokens = &v
+	system, messages, err := s.buildChatMessages(req.Messages, session)
+	if err != nil {
+		return chat.ChatRequest{}, err
 	}
 
 	cReq := chat.ChatRequest{
 		Model:           req.Model,
 		Messages:        messages,
-		System:          strings.Join(system, "\n"),
+		System:          system,
 		Temperature:     req.Temperature,
-		MaxTokens:       maxTokens,
+		MaxTokens:       copyMaxTokens(req.MaxTokens),
 		ReasoningEffort: req.ReasoningEffort,
 		Stream:          req.Stream,
 	}
-	if len(req.Tools) > 0 {
-		cReq.Tools = make([]chat.Tool, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			cReq.Tools = append(cReq.Tools, chat.Tool{
-				Name:        t.Function.Name,
-				Description: t.Function.Description,
-				InputSchema: t.Function.Parameters,
-			})
-		}
-	}
+	cReq.Tools = convertWireTools(req.Tools)
 	return cReq, nil
+}
+
+// buildChatMessages converts wire messages into the system prompt and the
+// canonical message list.
+func (s *Server) buildChatMessages(wire []chatMessage, session string) (string, []chat.Message, error) {
+	var system []string
+	var messages []chat.Message
+	for _, m := range wire {
+		msg, sysText, isSystem, err := s.convertWireMessage(m, session)
+		if err != nil {
+			return "", nil, err
+		}
+		if isSystem {
+			system = append(system, sysText)
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	return strings.Join(system, "\n"), messages, nil
+}
+
+// convertWireMessage translates one wire message. System-role messages return
+// isSystem with their text; all other roles return the canonical message.
+func (s *Server) convertWireMessage(m chatMessage, session string) (chat.Message, string, bool, error) {
+	content, err := anthropicContentText(m.Content)
+	if err != nil {
+		return chat.Message{}, "", false, err
+	}
+	if m.Role == "system" {
+		return chat.Message{}, content, true, nil
+	}
+	msg := chat.Message{Role: chat.Role(m.Role), Content: content, ToolCallID: m.ToolCallID, ReasoningContent: m.ReasoningContent}
+	msg.ToolCalls = toChatToolCalls(m.ToolCalls)
+	s.fillReasoningEcho(session, &msg)
+	return msg, "", false, nil
+}
+
+// toChatToolCalls translates wire tool calls into canonical calls. Arguments
+// is kept only when it is a non-empty valid JSON document.
+func toChatToolCalls(tcs []wireMessageToolCall) []chat.ToolCall {
+	if len(tcs) == 0 {
+		return nil
+	}
+	out := make([]chat.ToolCall, 0, len(tcs))
+	for _, tc := range tcs {
+		call := chat.ToolCall{ID: tc.ID, Name: tc.Function.Name}
+		if isJSONArguments(tc.Function.Arguments) {
+			call.Arguments = json.RawMessage(tc.Function.Arguments)
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+// isJSONArguments reports whether s is a non-empty valid JSON document.
+func isJSONArguments(s string) bool {
+	if s == "" {
+		return false
+	}
+	return json.Valid([]byte(s))
+}
+
+// fillReasoningEcho echoes cached reasoning_content onto an assistant
+// tool-call turn that carries none. Clients (OpenCode/OpenAI SDKs) never send
+// reasoning_content back; the value captured from the upstream response that
+// produced these tool calls is echoed, keyed by the first call's ID, or
+// thinking-mode upstreams reject the turn (DeepSeek 400
+// "reasoning_content must be passed back"). When the cache has nothing (calls
+// produced by a non-thinking provider, e.g. GLM without thinking enabled), a
+// placeholder keeps the turn routable.
+func (s *Server) fillReasoningEcho(session string, msg *chat.Message) {
+	if msg.Role != chat.Role("assistant") {
+		return
+	}
+	if len(msg.ToolCalls) == 0 {
+		return
+	}
+	if msg.ReasoningContent != "" {
+		return
+	}
+	id := msg.ToolCalls[0].ID
+	if r := reasoningByCallID.lookup(session, id); r != "" {
+		msg.ReasoningContent = r
+		s.deps.Logger.Debug("reasoning echo",
+			"session", session, "call_id", id, "found", true)
+		return
+	}
+	msg.ReasoningContent = reasoningPlaceholder
+	s.deps.Logger.Debug("reasoning echo",
+		"session", session, "call_id", id, "found", false, "injected", true)
+}
+
+// copyMaxTokens copies an optional max-tokens value.
+func copyMaxTokens(in *int) *int {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
+}
+
+// convertWireTools translates wire tool definitions into canonical tools.
+func convertWireTools(in []wireTool) []chat.Tool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]chat.Tool, 0, len(in))
+	for _, t := range in {
+		out = append(out, chat.Tool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			InputSchema: t.Function.Parameters,
+		})
+	}
+	return out
 }
 
 // mergeTools appends the server tools not already present by Name to the
@@ -531,7 +593,42 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 		return
 	}
 
-	succeeded := false
+	if s.runStreamCandidates(ctx, sw, sel, &cReq, candidates, clientToolNames, session, virtualModel) {
+		sw.writeDone()
+		return
+	}
+	// Every candidate failed before delivering any content: surface an error
+	// frame instead of a misleading empty 200 stream.
+	sw.writeError("all model candidates failed")
+	sw.writeDone()
+}
+
+// streamCapture is one buffered upstream stream attempt.
+type streamCapture struct {
+	deltas       []chat.StreamDelta
+	delivered    bool
+	endedInError bool
+	err          error
+}
+
+// captureStream buffers one upstream stream attempt.
+func captureStream(ctx context.Context, p chat.Provider, cReq chat.ChatRequest) streamCapture {
+	var cap streamCapture
+	cap.err = p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
+		cap.delivered = true
+		if d.FinishReason == "error" {
+			cap.endedInError = true
+		}
+		cap.deltas = append(cap.deltas, d)
+		return nil
+	})
+	return cap
+}
+
+// runStreamCandidates tries each candidate in order. It reports whether any
+// candidate delivered content (or errored after content), making the stream
+// final.
+func (s *Server) runStreamCandidates(ctx context.Context, sw *sseWriter, sel routing.Selector, cReq *chat.ChatRequest, candidates []routing.Candidate, clientToolNames map[string]bool, session, virtualModel string) bool {
 	for _, cand := range candidates {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -539,106 +636,121 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 			sel.RecordFailure(cand)
 			continue
 		}
-
-		delivered := false
-		endedInError := false
-		var deltas []chat.StreamDelta
-		streamErr := p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
-			delivered = true
-			if d.FinishReason == "error" {
-				endedInError = true
-			}
-			deltas = append(deltas, d)
-			return nil
-		})
-
-		if streamErr != nil && !delivered {
-			// 429 is never retried: straight to cooldown + failover.
-			if chat.IsRateLimit(streamErr) {
-				s.deps.Logger.Warn("provider stream rate limited",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
-				sel.RecordFailure(cand)
-				continue
-			}
-			// 4xx (permanent) fails over immediately — retrying can never
-			// succeed; only 5xx/timeout/connection (transient) is retried.
-			if !chat.IsRetryable(streamErr) {
-				s.deps.Logger.Warn("provider stream failed before content (permanent)",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
-				continue
-			}
-			// Transient pre-content failure: retry the same candidate up to
-			// maxAttempts total tries before failing over.
-			for attempt := 1; attempt < maxAttempts && streamErr != nil && !delivered; attempt++ {
-				s.deps.Logger.Warn("provider stream failed before content, retrying",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", streamErr)
-				delivered = false
-				endedInError = false
-				deltas = nil
-				streamErr = p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
-					delivered = true
-					if d.FinishReason == "error" {
-						endedInError = true
-					}
-					deltas = append(deltas, d)
-					return nil
-				})
-			}
-			if streamErr != nil && !delivered {
-				s.deps.Logger.Warn("provider stream failed before content after retries",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
-				continue
-			}
+		cap, serve := s.streamWithRetry(ctx, p, *cReq, cand, virtualModel, sel)
+		if !serve {
+			continue
 		}
-
-		if !endedInError {
+		if !cap.endedInError {
 			sel.RecordSuccess(cand)
 		}
 		// A candidate delivered content (or errored after content): the stream
 		// is final and cannot be failed over, so the loop must not continue.
-		succeeded = true
 		s.deps.Logger.Info("stream served",
 			"virtual_model", virtualModel,
 			"provider", cand.ProviderName,
 			"model", cand.Model)
-
-		if streamErr == nil && !endedInError {
-			// The stream completed cleanly: the buffered final chunk decides
-			// whether the tool calls belong to the server and must be executed
-			// internally instead of being forwarded.
-			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
-			resp := responseFromDeltas(deltas)
-			s.rememberReasoning(session, &resp)
-			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
-				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
-				if err != nil {
-					s.deps.Logger.Warn("provider completion failed during tool loop",
-						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-					_ = sw.writeError("tool execution failed: " + err.Error())
-				} else if err := sw.writeResponseBurst(cand.Model, *final); err != nil {
-					s.deps.Logger.Warn("stream write failed",
-						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-				}
-				break
-			}
-		}
-
-		// Replay the buffered deltas (plain content, client-owned or mixed
-		// tool calls, or an error-terminated stream) exactly as they arrived.
-		for _, d := range deltas {
-			if err := sw.writeChunk(cand.Model, d); err != nil {
-				s.deps.Logger.Warn("stream write failed",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-				break
-			}
-		}
-		break
+		s.serveStreamCapture(ctx, sw, p, cReq, cand, cap, clientToolNames, session, virtualModel)
+		return true
 	}
+	return false
+}
 
-	// Every candidate failed before delivering any content: surface an error
-	// frame instead of a misleading empty 200 stream.
-	if !succeeded {
-		sw.writeError("all model candidates failed")
+// streamWithRetry captures one candidate's stream, retrying transient
+// pre-content failures on the same candidate. It reports serve=false when the
+// candidate failed before delivering anything and the loop must fail over.
+func (s *Server) streamWithRetry(ctx context.Context, p chat.Provider, cReq chat.ChatRequest, cand routing.Candidate, virtualModel string, sel routing.Selector) (streamCapture, bool) {
+	cap := captureStream(ctx, p, cReq)
+	if cap.err == nil || cap.delivered {
+		return cap, true
 	}
-	sw.writeDone()
+	// 429 is never retried: straight to cooldown + failover.
+	if chat.IsRateLimit(cap.err) {
+		s.deps.Logger.Warn("provider stream rate limited",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
+		sel.RecordFailure(cand)
+		return cap, false
+	}
+	// 4xx (permanent) fails over immediately — retrying can never
+	// succeed; only 5xx/timeout/connection (transient) is retried.
+	if !chat.IsRetryable(cap.err) {
+		s.deps.Logger.Warn("provider stream failed before content (permanent)",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
+		return cap, false
+	}
+	// Transient pre-content failure: retry the same candidate up to
+	// maxAttempts total tries before failing over.
+	cap = s.retryStreamAfterFailure(ctx, p, cReq, cap, cand, virtualModel)
+	if cap.err != nil && !cap.delivered {
+		s.deps.Logger.Warn("provider stream failed before content after retries",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
+		return cap, false
+	}
+	return cap, true
+}
+
+// retryStreamAfterFailure retries a transient pre-content stream failure on
+// the same candidate up to maxAttempts total tries.
+func (s *Server) retryStreamAfterFailure(ctx context.Context, p chat.Provider, cReq chat.ChatRequest, cap streamCapture, cand routing.Candidate, virtualModel string) streamCapture {
+	for attempt := 1; attempt < maxAttempts; attempt++ {
+		if cap.err == nil || cap.delivered {
+			return cap
+		}
+		s.deps.Logger.Warn("provider stream failed before content, retrying",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", cap.err)
+		cap = captureStream(ctx, p, cReq)
+	}
+	return cap
+}
+
+// serveStreamCapture serves one candidate's buffered stream: server-owned tool
+// calls are executed internally as an SSE burst, everything else is replayed
+// exactly as it arrived.
+func (s *Server) serveStreamCapture(ctx context.Context, sw *sseWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, cap streamCapture, clientToolNames map[string]bool, session, virtualModel string) {
+	if s.tryServeToolBurst(ctx, sw, p, cReq, cand, cap, clientToolNames, session, virtualModel) {
+		return
+	}
+	// Replay the buffered deltas (plain content, client-owned or mixed
+	// tool calls, or an error-terminated stream) exactly as they arrived.
+	s.replayStreamDeltas(sw, cand, cap.deltas, virtualModel)
+}
+
+// tryServeToolBurst executes server-owned tool calls internally and emits the
+// result as an SSE burst. It reports whether the burst path was taken (so the
+// caller must not replay the buffered deltas).
+func (s *Server) tryServeToolBurst(ctx context.Context, sw *sseWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, cap streamCapture, clientToolNames map[string]bool, session, virtualModel string) bool {
+	if cap.err != nil || cap.endedInError {
+		return false
+	}
+	// The stream completed cleanly: the buffered final chunk decides
+	// whether the tool calls belong to the server and must be executed
+	// internally instead of being forwarded.
+	// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
+	resp := responseFromDeltas(cap.deltas)
+	s.rememberReasoning(session, &resp)
+	if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+		return false
+	}
+	final, err := s.executeServerTools(ctx, p, cReq, &resp, clientToolNames, session)
+	if err != nil {
+		s.deps.Logger.Warn("provider completion failed during tool loop",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+		_ = sw.writeError("tool execution failed: " + err.Error())
+		return true
+	}
+	if err := sw.writeResponseBurst(cand.Model, *final); err != nil {
+		s.deps.Logger.Warn("stream write failed",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+	}
+	return true
+}
+
+// replayStreamDeltas writes each buffered delta as an SSE chunk in order.
+func (s *Server) replayStreamDeltas(sw *sseWriter, cand routing.Candidate, deltas []chat.StreamDelta, virtualModel string) {
+	for _, d := range deltas {
+		if err := sw.writeChunk(cand.Model, d); err != nil {
+			s.deps.Logger.Warn("stream write failed",
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+			break
+		}
+	}
 }

@@ -400,98 +400,195 @@ func (p *geminiProvider) Complete(ctx context.Context, req chat.ChatRequest) (ch
 func (p *geminiProvider) Stream(ctx context.Context, req chat.ChatRequest, emit chat.StreamFunc) error {
 	ctx, cancel := context.WithTimeout(ctx, streamTimeout)
 	defer cancel()
+	resp, err := p.doStreamRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return consumeGeminiStream(resp.Body, emit)
+}
+
+// doStreamRequest issues the streaming HTTP request and maps non-200
+// responses to typed errors. The caller owns closing the response body.
+func (p *geminiProvider) doStreamRequest(ctx context.Context, req chat.ChatRequest) (*http.Response, error) {
 	body, err := buildGeminiRequest(req)
 	if err != nil {
-		return fmt.Errorf("gemini: build request: %w", err)
+		return nil, fmt.Errorf("gemini: build request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(req.Model, true), bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("gemini: new request: %w", err)
+		return nil, fmt.Errorf("gemini: new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-goog-api-key", p.apiKey)
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("gemini: request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusTooManyRequests {
-			return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
-		}
-		return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
+		return nil, fmt.Errorf("gemini: request: %w", err)
 	}
 
-	delivered := false
-	var usage *chat.Usage
-	finishReason := ""
-	var toolCall *chat.ToolCall
+	if err := checkGeminiStreamStatus(p, resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp, nil
+}
 
-	scanner := bufio.NewScanner(resp.Body)
+// consumeGeminiStream parses the SSE frame stream and drives emit.
+func consumeGeminiStream(r io.Reader, emit chat.StreamFunc) error {
+	st := &geminiStreamState{}
+
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		payload, ok := geminiDataPayload(scanner.Text())
+		if !ok {
 			continue
 		}
-		payload := strings.TrimPrefix(line, "data: ")
-
-		var chunk geminiResponse
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			if delivered {
-				_ = emit(chat.StreamDelta{FinishReason: "error"})
-				return nil
-			}
-			return fmt.Errorf("gemini: parse chunk: %w", err)
+		done, err := handleGeminiStreamPayload(payload, st, emit)
+		if err != nil {
+			return err
 		}
-
-		if len(chunk.Candidates) > 0 {
-			c := chunk.Candidates[0]
-			for _, part := range c.Content.Parts {
-				if part.FunctionCall != nil {
-					fc := part.FunctionCall
-					args, err := json.Marshal(fc.Arguments)
-					if err != nil {
-						return fmt.Errorf("gemini: marshal function args: %w", err)
-					}
-					toolCall = &chat.ToolCall{ID: "", Name: fc.Name, Arguments: args}
-					continue
-				}
-				if part.Text == "" {
-					continue
-				}
-				delivered = true
-				if err := emit(chat.StreamDelta{Delta: part.Text}); err != nil {
-					return err
-				}
-			}
-			if c.FinishReason != "" {
-				finishReason = geminiFinishReason(c.FinishReason)
-			}
-		}
-
-		if chunk.UsageMetadata.PromptTokenCount != 0 ||
-			chunk.UsageMetadata.CandidatesTokenCount != 0 ||
-			chunk.UsageMetadata.TotalTokenCount != 0 {
-			u := geminiUsage(chunk.UsageMetadata)
-			usage = &u
+		if done {
+			return nil
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		if delivered {
-			_ = emit(chat.StreamDelta{FinishReason: "error"})
-			return nil
-		}
-		return fmt.Errorf("gemini: read stream: %w", err)
+		return handleGeminiScanError(err, st, emit)
 	}
 
-	if toolCall != nil {
-		return emit(chat.StreamDelta{FinishReason: "tool_calls", ToolCalls: []chat.ToolCall{*toolCall}})
+	return emitGeminiFinal(st, emit)
+}
+
+// geminiStreamState accumulates streaming progress across SSE frames.
+type geminiStreamState struct {
+	delivered    bool
+	usage        *chat.Usage
+	finishReason string
+	toolCall     *chat.ToolCall
+}
+
+// checkGeminiStreamStatus maps a non-200 stream response to a typed error.
+func checkGeminiStreamStatus(p *geminiProvider, resp *http.Response) error {
+	if resp.StatusCode == http.StatusOK {
+		return nil
 	}
-	return emit(chat.StreamDelta{FinishReason: finishReason, Usage: usage})
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &chat.RateLimitError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
+	}
+	return &chat.ProviderError{Provider: p.Name(), StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
+}
+
+// geminiDataPayload extracts the payload of a `data: {...}` SSE line.
+func geminiDataPayload(line string) (string, bool) {
+	if !strings.HasPrefix(line, "data: ") {
+		return "", false
+	}
+	return strings.TrimPrefix(line, "data: "), true
+}
+
+// handleGeminiStreamPayload decodes one frame and folds it into the state.
+// done is true when the stream is finished and the caller must return nil
+// (malformed frame after content: error delta already emitted).
+func handleGeminiStreamPayload(payload string, st *geminiStreamState, emit chat.StreamFunc) (done bool, err error) {
+	chunk, done, err := parseGeminiChunk(payload, st.delivered, emit)
+	if err != nil || done || chunk == nil {
+		return done, err
+	}
+	if err := applyGeminiCandidate(chunk, st, emit); err != nil {
+		return false, err
+	}
+	applyGeminiUsage(chunk, st)
+	return false, nil
+}
+
+// parseGeminiChunk decodes one frame. done is true when the frame was a
+// malformed payload after content: the error delta is emitted and the stream
+// must end (caller returns nil).
+func parseGeminiChunk(payload string, delivered bool, emit chat.StreamFunc) (*geminiResponse, bool, error) {
+	var chunk geminiResponse
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		if delivered {
+			_ = emit(chat.StreamDelta{FinishReason: "error"})
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("gemini: parse chunk: %w", err)
+	}
+	return &chunk, false, nil
+}
+
+// applyGeminiCandidate folds one chunk's candidate into text deltas, the
+// pending tool call, and the finish reason.
+func applyGeminiCandidate(chunk *geminiResponse, st *geminiStreamState, emit chat.StreamFunc) error {
+	if len(chunk.Candidates) == 0 {
+		return nil
+	}
+	c := chunk.Candidates[0]
+	for _, part := range c.Content.Parts {
+		if err := applyGeminiPart(part, st, emit); err != nil {
+			return err
+		}
+	}
+	if c.FinishReason != "" {
+		st.finishReason = geminiFinishReason(c.FinishReason)
+	}
+	return nil
+}
+
+// applyGeminiPart handles one content part: function calls update the pending
+// tool call, empty text is skipped, otherwise a text delta is emitted.
+func applyGeminiPart(part geminiPart, st *geminiStreamState, emit chat.StreamFunc) error {
+	if part.FunctionCall != nil {
+		return storeGeminiToolCall(part, st)
+	}
+	if part.Text == "" {
+		return nil
+	}
+	st.delivered = true
+	return emit(chat.StreamDelta{Delta: part.Text})
+}
+
+// storeGeminiToolCall records the latest function call as the pending tool
+// call (later calls overwrite earlier ones).
+func storeGeminiToolCall(part geminiPart, st *geminiStreamState) error {
+	fc := part.FunctionCall
+	args, err := json.Marshal(fc.Arguments)
+	if err != nil {
+		return fmt.Errorf("gemini: marshal function args: %w", err)
+	}
+	st.toolCall = &chat.ToolCall{ID: "", Name: fc.Name, Arguments: args}
+	return nil
+}
+
+// applyGeminiUsage records usage when the chunk carries any token counts.
+func applyGeminiUsage(chunk *geminiResponse, st *geminiStreamState) {
+	if chunk.UsageMetadata.PromptTokenCount != 0 ||
+		chunk.UsageMetadata.CandidatesTokenCount != 0 ||
+		chunk.UsageMetadata.TotalTokenCount != 0 {
+		u := geminiUsage(chunk.UsageMetadata)
+		st.usage = &u
+	}
+}
+
+// handleGeminiScanError maps a scanner failure to an emitted error delta
+// (after content) or a returned error (before any content).
+func handleGeminiScanError(err error, st *geminiStreamState, emit chat.StreamFunc) error {
+	if st.delivered {
+		_ = emit(chat.StreamDelta{FinishReason: "error"})
+		return nil
+	}
+	return fmt.Errorf("gemini: read stream: %w", err)
+}
+
+// emitGeminiFinal emits the closing chunk: tool_calls when a function call
+// was seen, otherwise the accumulated finish reason and usage.
+func emitGeminiFinal(st *geminiStreamState, emit chat.StreamFunc) error {
+	if st.toolCall != nil {
+		return emit(chat.StreamDelta{FinishReason: "tool_calls", ToolCalls: []chat.ToolCall{*st.toolCall}})
+	}
+	return emit(chat.StreamDelta{FinishReason: st.finishReason, Usage: st.usage})
 }

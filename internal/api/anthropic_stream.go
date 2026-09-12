@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -232,6 +233,18 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 		return
 	}
 
+	if s.runAnthropicCandidates(ctx, sw, sel, &cReq, candidates, clientToolNames, session, virtualModel) {
+		return
+	}
+	// Every candidate failed before delivering any content.
+	_ = sw.errorEvent("all model candidates failed")
+	_ = sw.messageStop()
+}
+
+// runAnthropicCandidates tries each candidate in order. It reports whether any
+// candidate delivered content (or errored after content), making the stream
+// final.
+func (s *Server) runAnthropicCandidates(ctx context.Context, sw *anthropicSSEWriter, sel routing.Selector, cReq *chat.ChatRequest, candidates []routing.Candidate, clientToolNames map[string]bool, session, virtualModel string) bool {
 	for _, cand := range candidates {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -239,71 +252,79 @@ func (s *Server) anthropicStream(w http.ResponseWriter, r *http.Request, sel rou
 			sel.RecordFailure(cand)
 			continue
 		}
-
-		delivered := false
-		endedInError := false
-		var deltas []chat.StreamDelta
-		streamErr := p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
-			delivered = true
-			if d.FinishReason == "error" {
-				endedInError = true
-			}
-			deltas = append(deltas, d)
-			return nil
-		})
-
-		if streamErr != nil && !delivered {
+		got := captureStream(ctx, p, *cReq)
+		if got.err != nil && !got.delivered {
 			s.deps.Logger.Warn("anthropic stream failed before content",
-				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", streamErr)
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", got.err)
 			sel.RecordFailure(cand)
 			continue
 		}
-
-		if endedInError {
-			sel.RecordFailure(cand)
-		} else {
-			sel.RecordSuccess(cand)
-		}
+		s.recordAnthropicOutcome(sel, cand, got.endedInError)
 		s.deps.Logger.Info("stream served",
 			"virtual_model", virtualModel,
 			"provider", cand.ProviderName,
 			"model", cand.Model)
+		s.serveAnthropicCapture(ctx, sw, p, cReq, cand, got, clientToolNames, session, virtualModel)
+		return true
+	}
+	return false
+}
 
-		if streamErr == nil && !endedInError {
-			// The stream completed cleanly: the buffered final chunk decides
-			// whether the tool calls belong to the server and must be executed
-			// internally instead of being forwarded.
-			// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
-			resp := responseFromDeltas(deltas)
-			s.rememberReasoning(session, &resp)
-			if s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
-				final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
-				if err != nil {
-					s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
-						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-					_ = sw.errorEvent("tool execution failed: " + err.Error())
-					_ = sw.messageStop()
-				} else if err := sw.writeResponseBurst(*final); err != nil {
-					s.deps.Logger.Warn("anthropic stream write failed",
-						"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-				}
-				return
-			}
-		}
-
-		// Replay the buffered deltas (plain content, client-owned or mixed
-		// tool calls, or an error-terminated stream) exactly as they arrived.
-		for _, d := range deltas {
-			if err := sw.emitDelta(d); err != nil {
-				s.deps.Logger.Warn("anthropic stream write failed",
-					"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-				break
-			}
-		}
+// recordAnthropicOutcome records a delivered stream: an error-terminated
+// stream counts as a failure, a clean one as a success.
+func (s *Server) recordAnthropicOutcome(sel routing.Selector, cand routing.Candidate, endedInError bool) {
+	if endedInError {
+		sel.RecordFailure(cand)
 		return
 	}
+	sel.RecordSuccess(cand)
+}
 
-	// Every candidate failed before delivering any content.
-	_ = sw.errorEvent("all model candidates failed")
-	_ = sw.messageStop()
+// serveAnthropicCapture serves one candidate's buffered stream: server-owned
+// tool calls are executed internally as an event burst, everything else is
+// replayed exactly as it arrived.
+func (s *Server) serveAnthropicCapture(ctx context.Context, sw *anthropicSSEWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, got streamCapture, clientToolNames map[string]bool, session, virtualModel string) {
+	if s.tryServeAnthropicToolBurst(ctx, sw, p, cReq, cand, got, clientToolNames, session, virtualModel) {
+		return
+	}
+	// Replay the buffered deltas (plain content, client-owned or mixed
+	// tool calls, or an error-terminated stream) exactly as they arrived.
+	for _, d := range got.deltas {
+		if err := sw.emitDelta(d); err != nil {
+			s.deps.Logger.Warn("anthropic stream write failed",
+				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+			break
+		}
+	}
+}
+
+// tryServeAnthropicToolBurst executes server-owned tool calls internally and
+// emits the result as an Anthropic event burst. It reports whether the burst
+// path was taken (so the caller must not replay the buffered deltas).
+func (s *Server) tryServeAnthropicToolBurst(ctx context.Context, sw *anthropicSSEWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, got streamCapture, clientToolNames map[string]bool, session, virtualModel string) bool {
+	if got.err != nil || got.endedInError {
+		return false
+	}
+	// The stream completed cleanly: the buffered final chunk decides
+	// whether the tool calls belong to the server and must be executed
+	// internally instead of being forwarded.
+	// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
+	resp := responseFromDeltas(got.deltas)
+	s.rememberReasoning(session, &resp)
+	if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+		return false
+	}
+	final, err := s.executeServerTools(ctx, p, cReq, &resp, clientToolNames, session)
+	if err != nil {
+		s.deps.Logger.Warn("anthropic provider completion failed during tool loop",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+		_ = sw.errorEvent("tool execution failed: " + err.Error())
+		_ = sw.messageStop()
+		return true
+	}
+	if err := sw.writeResponseBurst(*final); err != nil {
+		s.deps.Logger.Warn("anthropic stream write failed",
+			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+	}
+	return true
 }
