@@ -22,19 +22,19 @@ type geminiCapture struct {
 }
 
 // newGeminiCaptureServer starts a fake Gemini upstream that records every
-// request into cap and replies with respBody.
-func newGeminiCaptureServer(t *testing.T, cap *geminiCapture, respBody string) *httptest.Server {
+// request into capture and replies with respBody.
+func newGeminiCaptureServer(t *testing.T, capture *geminiCapture, respBody string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cap.path = r.URL.Path
-		cap.auth = r.Header.Get("x-goog-api-key")
-		cap.contentType = r.Header.Get("Content-Type")
+		capture.path = r.URL.Path
+		capture.auth = r.Header.Get("x-goog-api-key")
+		capture.contentType = r.Header.Get("Content-Type")
 		b, _ := io.ReadAll(r.Body)
 		var body geminiRequest
 		if err := json.Unmarshal(b, &body); err != nil {
 			t.Errorf("decode request body: %v", err)
 		}
-		cap.bodies = append(cap.bodies, body)
+		capture.bodies = append(capture.bodies, body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, respBody)
 	}))
@@ -42,16 +42,16 @@ func newGeminiCaptureServer(t *testing.T, cap *geminiCapture, respBody string) *
 	return srv
 }
 
-func assertGeminiEndpoint(t *testing.T, cap *geminiCapture, wantPath, wantAuth string) {
+func assertGeminiEndpoint(t *testing.T, capture *geminiCapture, wantPath, wantAuth string) {
 	t.Helper()
-	if cap.path != wantPath {
-		t.Errorf("path = %q", cap.path)
+	if capture.path != wantPath {
+		t.Errorf("path = %q", capture.path)
 	}
-	if cap.auth != wantAuth {
-		t.Errorf("auth header = %q", cap.auth)
+	if capture.auth != wantAuth {
+		t.Errorf("auth header = %q", capture.auth)
 	}
-	if cap.contentType != "application/json" {
-		t.Errorf("content-type = %q", cap.contentType)
+	if capture.contentType != "application/json" {
+		t.Errorf("content-type = %q", capture.contentType)
 	}
 }
 
@@ -115,8 +115,8 @@ func assertGeminiResponseParsing(t *testing.T, resp chat.ChatResponse) {
 // request-body translation (contents, systemInstruction, generationConfig) and
 // the response parts[].text parsing.
 func TestGeminiComplete_RequestMappingAndParsing(t *testing.T) {
-	var cap geminiCapture
-	srv := newGeminiCaptureServer(t, &cap, `{
+	var capture geminiCapture
+	srv := newGeminiCaptureServer(t, &capture, `{
 		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
 		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
 		"responseId":"resp-1"
@@ -140,18 +140,18 @@ func TestGeminiComplete_RequestMappingAndParsing(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
-	assertGeminiEndpoint(t, &cap, "/models/gemini-2.5-flash:generateContent", "test-key")
-	assertGeminiContentsMapping(t, cap.bodies[0])
-	assertGeminiSystemInstruction(t, cap.bodies[0], "be concise")
-	assertGeminiTempAndMaxTokens(t, cap.bodies[0], 0.7, 100)
+	assertGeminiEndpoint(t, &capture, "/models/gemini-2.5-flash:generateContent", "test-key")
+	assertGeminiContentsMapping(t, capture.bodies[0])
+	assertGeminiSystemInstruction(t, capture.bodies[0], "be concise")
+	assertGeminiTempAndMaxTokens(t, capture.bodies[0], 0.7, 100)
 	assertGeminiResponseParsing(t, resp)
 }
 
 // TestGeminiComplete_ThinkingLevelGemini3 verifies the Gemini 3 family maps
 // effort to thinkingLevel and forces temperature to 1.0.
 func TestGeminiComplete_ThinkingLevelGemini3(t *testing.T) {
-	var cap geminiCapture
-	srv := newGeminiCaptureServer(t, &cap, `{
+	var capture geminiCapture
+	srv := newGeminiCaptureServer(t, &capture, `{
 		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
 		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
 		"responseId":"resp-1"
@@ -168,8 +168,8 @@ func TestGeminiComplete_ThinkingLevelGemini3(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete (gemini-3-pro): %v", err)
 	}
-	assertGeminiThinkingLevel(t, cap.bodies[0].GenerationConfig, "high")
-	assertGeminiForcedTemperature(t, cap.bodies[0].GenerationConfig, 1.0)
+	assertGeminiThinkingLevel(t, capture.bodies[0].GenerationConfig, "high")
+	assertGeminiForcedTemperature(t, capture.bodies[0].GenerationConfig, 1.0)
 }
 
 func assertGeminiThinkingLevel(t *testing.T, cfg *geminiGenConfig, want string) {
@@ -193,8 +193,8 @@ func assertGeminiForcedTemperature(t *testing.T, cfg *geminiGenConfig, want floa
 // TestGeminiComplete_ThinkingBudget25 verifies the 2.5 family maps effort to
 // a token budget with no thinkingLevel.
 func TestGeminiComplete_ThinkingBudget25(t *testing.T) {
-	var cap geminiCapture
-	srv := newGeminiCaptureServer(t, &cap, `{
+	var capture geminiCapture
+	srv := newGeminiCaptureServer(t, &capture, `{
 		"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"},{"text":" world"}]},"finishReason":"STOP"}],
 		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":30},
 		"responseId":"resp-1"
@@ -209,7 +209,7 @@ func TestGeminiComplete_ThinkingBudget25(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Complete (gemini-2.5-flash): %v", err)
 	}
-	assertGeminiThinkingBudget(t, cap.bodies[0].GenerationConfig, 4096)
+	assertGeminiThinkingBudget(t, capture.bodies[0].GenerationConfig, 4096)
 }
 
 func assertGeminiThinkingBudget(t *testing.T, cfg *geminiGenConfig, want int) {

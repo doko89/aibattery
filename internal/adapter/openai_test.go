@@ -31,8 +31,8 @@ type openAICapture struct {
 }
 
 // newOpenAICompleteServer starts a fake OpenAI chat-completions upstream that
-// checks path/method, records the request into cap, and replies with respBody.
-func newOpenAICompleteServer(t *testing.T, cap *openAICapture, respBody string) *httptest.Server {
+// checks path/method, records the request into capture, and replies with respBody.
+func newOpenAICompleteServer(t *testing.T, capture *openAICapture, respBody string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
@@ -41,9 +41,9 @@ func newOpenAICompleteServer(t *testing.T, cap *openAICapture, respBody string) 
 		if r.Method != http.MethodPost {
 			t.Errorf("unexpected method: %s", r.Method)
 		}
-		cap.auth = r.Header.Get("Authorization")
-		cap.contentType = r.Header.Get("Content-Type")
-		cap.body = captureRequest(t, r)
+		capture.auth = r.Header.Get("Authorization")
+		capture.contentType = r.Header.Get("Content-Type")
+		capture.body = captureRequest(t, r)
 
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, respBody)
@@ -63,13 +63,13 @@ const openAICompleteStub = `{
 	"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
 }`
 
-func assertOpenAIHeaders(t *testing.T, cap *openAICapture) {
+func assertOpenAIHeaders(t *testing.T, capture *openAICapture) {
 	t.Helper()
-	if cap.auth != "Bearer sk-test" {
-		t.Errorf("Authorization = %q, want Bearer sk-test", cap.auth)
+	if capture.auth != "Bearer sk-test" {
+		t.Errorf("Authorization = %q, want Bearer sk-test", capture.auth)
 	}
-	if cap.contentType != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", cap.contentType)
+	if capture.contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", capture.contentType)
 	}
 }
 
@@ -140,8 +140,8 @@ func checkOpenAIResponseContent(t *testing.T, resp chat.ChatResponse) {
 }
 
 func TestComplete_TranslationAndParsing(t *testing.T) {
-	var cap openAICapture
-	srv := newOpenAICompleteServer(t, &cap, openAICompleteStub)
+	var capture openAICapture
+	srv := newOpenAICompleteServer(t, &capture, openAICompleteStub)
 
 	p := NewOpenAIProvider(srv.URL, "sk-test", 5*time.Second)
 	if p.Name() != "openai" {
@@ -165,17 +165,17 @@ func TestComplete_TranslationAndParsing(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
-	assertOpenAIHeaders(t, &cap)
-	assertOpenAIMessages(t, cap.body)
-	assertOpenAIOptionals(t, cap.body)
+	assertOpenAIHeaders(t, &capture)
+	assertOpenAIMessages(t, capture.body)
+	assertOpenAIOptionals(t, capture.body)
 	assertOpenAIChatResponse(t, resp)
 }
 
 // TestComplete_ReasoningEffortDropsTemperature verifies that setting
 // reasoning effort passes it through and drops temperature.
 func TestComplete_ReasoningEffortDropsTemperature(t *testing.T) {
-	var cap openAICapture
-	srv := newOpenAICompleteServer(t, &cap, openAICompleteStub)
+	var capture openAICapture
+	srv := newOpenAICompleteServer(t, &capture, openAICompleteStub)
 
 	p := NewOpenAIProvider(srv.URL, "sk-test", 5*time.Second)
 
@@ -195,7 +195,7 @@ func TestComplete_ReasoningEffortDropsTemperature(t *testing.T) {
 	if _, err := p.Complete(context.Background(), req); err != nil {
 		t.Fatalf("Complete (reasoning): %v", err)
 	}
-	assertOpenAIReasoningEffort(t, cap.body)
+	assertOpenAIReasoningEffort(t, capture.body)
 }
 
 func assertOpenAIReasoningEffort(t *testing.T, got openAIRequest) {
