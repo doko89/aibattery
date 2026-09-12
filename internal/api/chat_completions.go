@@ -593,7 +593,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, sel ro
 		return
 	}
 
-	if s.runStreamCandidates(ctx, sw, sel, &cReq, candidates, clientToolNames, session, virtualModel) {
+	if s.runStreamCandidates(ctx, sw, sel, &cReq, candidates, streamRunEnv{clientToolNames: clientToolNames, session: session, virtualModel: virtualModel}) {
 		sw.writeDone()
 		return
 	}
@@ -611,24 +611,60 @@ type streamCapture struct {
 	err          error
 }
 
+// streamRunEnv groups request-scoped streaming state so helper signatures
+// stay within the parameter limit.
+type streamRunEnv struct {
+	clientToolNames map[string]bool
+	session         string
+	virtualModel    string
+}
+
+// streamFailoverEnv groups the failover context for one candidate attempt.
+type streamFailoverEnv struct {
+	virtualModel string
+	sel          routing.Selector
+}
+
+// streamRetryEnv groups the state retried on the same candidate after a
+// transient pre-content failure.
+type streamRetryEnv struct {
+	p            chat.Provider
+	cReq         chat.ChatRequest
+	capture      streamCapture
+	cand         routing.Candidate
+	virtualModel string
+}
+
+// streamServeEnv groups the state needed to serve one candidate's buffered
+// stream, either as an internal tool burst or an exact replay.
+type streamServeEnv struct {
+	p               chat.Provider
+	cReq            *chat.ChatRequest
+	cand            routing.Candidate
+	capture         streamCapture
+	clientToolNames map[string]bool
+	session         string
+	virtualModel    string
+}
+
 // captureStream buffers one upstream stream attempt.
 func captureStream(ctx context.Context, p chat.Provider, cReq chat.ChatRequest) streamCapture {
-	var cap streamCapture
-	cap.err = p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
-		cap.delivered = true
+	var capture streamCapture
+	capture.err = p.Stream(ctx, cReq, func(d chat.StreamDelta) error {
+		capture.delivered = true
 		if d.FinishReason == "error" {
-			cap.endedInError = true
+			capture.endedInError = true
 		}
-		cap.deltas = append(cap.deltas, d)
+		capture.deltas = append(capture.deltas, d)
 		return nil
 	})
-	return cap
+	return capture
 }
 
 // runStreamCandidates tries each candidate in order. It reports whether any
 // candidate delivered content (or errored after content), making the stream
 // final.
-func (s *Server) runStreamCandidates(ctx context.Context, sw *sseWriter, sel routing.Selector, cReq *chat.ChatRequest, candidates []routing.Candidate, clientToolNames map[string]bool, session, virtualModel string) bool {
+func (s *Server) runStreamCandidates(ctx context.Context, sw *sseWriter, sel routing.Selector, cReq *chat.ChatRequest, candidates []routing.Candidate, env streamRunEnv) bool {
 	for _, cand := range candidates {
 		cReq.Model = cand.Model
 		p, ok := s.deps.Providers[cand.ProviderName]
@@ -636,20 +672,20 @@ func (s *Server) runStreamCandidates(ctx context.Context, sw *sseWriter, sel rou
 			sel.RecordFailure(cand)
 			continue
 		}
-		cap, serve := s.streamWithRetry(ctx, p, *cReq, cand, virtualModel, sel)
+		capture, serve := s.streamWithRetry(ctx, p, *cReq, cand, streamFailoverEnv{virtualModel: env.virtualModel, sel: sel})
 		if !serve {
 			continue
 		}
-		if !cap.endedInError {
+		if !capture.endedInError {
 			sel.RecordSuccess(cand)
 		}
 		// A candidate delivered content (or errored after content): the stream
 		// is final and cannot be failed over, so the loop must not continue.
 		s.deps.Logger.Info("stream served",
-			"virtual_model", virtualModel,
+			"virtual_model", env.virtualModel,
 			"provider", cand.ProviderName,
 			"model", cand.Model)
-		s.serveStreamCapture(ctx, sw, p, cReq, cand, cap, clientToolNames, session, virtualModel)
+		s.serveStreamCapture(ctx, sw, streamServeEnv{p: p, cReq: cReq, cand: cand, capture: capture, clientToolNames: env.clientToolNames, session: env.session, virtualModel: env.virtualModel})
 		return true
 	}
 	return false
@@ -658,88 +694,89 @@ func (s *Server) runStreamCandidates(ctx context.Context, sw *sseWriter, sel rou
 // streamWithRetry captures one candidate's stream, retrying transient
 // pre-content failures on the same candidate. It reports serve=false when the
 // candidate failed before delivering anything and the loop must fail over.
-func (s *Server) streamWithRetry(ctx context.Context, p chat.Provider, cReq chat.ChatRequest, cand routing.Candidate, virtualModel string, sel routing.Selector) (streamCapture, bool) {
-	cap := captureStream(ctx, p, cReq)
-	if cap.err == nil || cap.delivered {
-		return cap, true
+func (s *Server) streamWithRetry(ctx context.Context, p chat.Provider, cReq chat.ChatRequest, cand routing.Candidate, env streamFailoverEnv) (streamCapture, bool) {
+	capture := captureStream(ctx, p, cReq)
+	if capture.err == nil || capture.delivered {
+		return capture, true
 	}
 	// 429 is never retried: straight to cooldown + failover.
-	if chat.IsRateLimit(cap.err) {
+	if chat.IsRateLimit(capture.err) {
 		s.deps.Logger.Warn("provider stream rate limited",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
-		sel.RecordFailure(cand)
-		return cap, false
+			"virtual_model", env.virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", capture.err)
+		env.sel.RecordFailure(cand)
+		return capture, false
 	}
 	// 4xx (permanent) fails over immediately — retrying can never
 	// succeed; only 5xx/timeout/connection (transient) is retried.
-	if !chat.IsRetryable(cap.err) {
+	if !chat.IsRetryable(capture.err) {
 		s.deps.Logger.Warn("provider stream failed before content (permanent)",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
-		return cap, false
+			"virtual_model", env.virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", capture.err)
+		return capture, false
 	}
 	// Transient pre-content failure: retry the same candidate up to
 	// maxAttempts total tries before failing over.
-	cap = s.retryStreamAfterFailure(ctx, p, cReq, cap, cand, virtualModel)
-	if cap.err != nil && !cap.delivered {
+	capture = s.retryStreamAfterFailure(ctx, streamRetryEnv{p: p, cReq: cReq, capture: capture, cand: cand, virtualModel: env.virtualModel})
+	if capture.err != nil && !capture.delivered {
 		s.deps.Logger.Warn("provider stream failed before content after retries",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", cap.err)
-		return cap, false
+			"virtual_model", env.virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", capture.err)
+		return capture, false
 	}
-	return cap, true
+	return capture, true
 }
 
 // retryStreamAfterFailure retries a transient pre-content stream failure on
 // the same candidate up to maxAttempts total tries.
-func (s *Server) retryStreamAfterFailure(ctx context.Context, p chat.Provider, cReq chat.ChatRequest, cap streamCapture, cand routing.Candidate, virtualModel string) streamCapture {
+func (s *Server) retryStreamAfterFailure(ctx context.Context, env streamRetryEnv) streamCapture {
+	capture := env.capture
 	for attempt := 1; attempt < maxAttempts; attempt++ {
-		if cap.err == nil || cap.delivered {
-			return cap
+		if capture.err == nil || capture.delivered {
+			return capture
 		}
 		s.deps.Logger.Warn("provider stream failed before content, retrying",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "attempt", attempt, "error", cap.err)
-		cap = captureStream(ctx, p, cReq)
+			"virtual_model", env.virtualModel, "provider", env.cand.ProviderName, "model", env.cand.Model, "attempt", attempt, "error", capture.err)
+		capture = captureStream(ctx, env.p, env.cReq)
 	}
-	return cap
+	return capture
 }
 
 // serveStreamCapture serves one candidate's buffered stream: server-owned tool
 // calls are executed internally as an SSE burst, everything else is replayed
 // exactly as it arrived.
-func (s *Server) serveStreamCapture(ctx context.Context, sw *sseWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, cap streamCapture, clientToolNames map[string]bool, session, virtualModel string) {
-	if s.tryServeToolBurst(ctx, sw, p, cReq, cand, cap, clientToolNames, session, virtualModel) {
+func (s *Server) serveStreamCapture(ctx context.Context, sw *sseWriter, env streamServeEnv) {
+	if s.tryServeToolBurst(ctx, sw, env) {
 		return
 	}
 	// Replay the buffered deltas (plain content, client-owned or mixed
 	// tool calls, or an error-terminated stream) exactly as they arrived.
-	s.replayStreamDeltas(sw, cand, cap.deltas, virtualModel)
+	s.replayStreamDeltas(sw, env.cand, env.capture.deltas, env.virtualModel)
 }
 
 // tryServeToolBurst executes server-owned tool calls internally and emits the
 // result as an SSE burst. It reports whether the burst path was taken (so the
 // caller must not replay the buffered deltas).
-func (s *Server) tryServeToolBurst(ctx context.Context, sw *sseWriter, p chat.Provider, cReq *chat.ChatRequest, cand routing.Candidate, cap streamCapture, clientToolNames map[string]bool, session, virtualModel string) bool {
-	if cap.err != nil || cap.endedInError {
+func (s *Server) tryServeToolBurst(ctx context.Context, sw *sseWriter, env streamServeEnv) bool {
+	if env.capture.err != nil || env.capture.endedInError {
 		return false
 	}
 	// The stream completed cleanly: the buffered final chunk decides
 	// whether the tool calls belong to the server and must be executed
 	// internally instead of being forwarded.
 	// ponytail: streaming is buffered until the final chunk to decide tool ownership; a lookahead could stream text deltas but risks leaking server tool_calls
-	resp := responseFromDeltas(cap.deltas)
-	s.rememberReasoning(session, &resp)
-	if !s.allServerToolCalls(resp.ToolCalls, clientToolNames) {
+	resp := responseFromDeltas(env.capture.deltas)
+	s.rememberReasoning(env.session, &resp)
+	if !s.allServerToolCalls(resp.ToolCalls, env.clientToolNames) {
 		return false
 	}
-	final, err := s.executeServerTools(ctx, p, cReq, &resp, clientToolNames, session)
+	final, err := s.executeServerTools(ctx, env.p, env.cReq, &resp, env.clientToolNames, env.session)
 	if err != nil {
 		s.deps.Logger.Warn("provider completion failed during tool loop",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+			"virtual_model", env.virtualModel, "provider", env.cand.ProviderName, "model", env.cand.Model, "error", err)
 		_ = sw.writeError("tool execution failed: " + err.Error())
 		return true
 	}
-	if err := sw.writeResponseBurst(cand.Model, *final); err != nil {
+	if err := sw.writeResponseBurst(env.cand.Model, *final); err != nil {
 		s.deps.Logger.Warn("stream write failed",
-			"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
+			"virtual_model", env.virtualModel, "provider", env.cand.ProviderName, "model", env.cand.Model, "error", err)
 	}
 	return true
 }
