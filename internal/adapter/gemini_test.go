@@ -25,20 +25,18 @@ type geminiCapture struct {
 // request into capture and replies with respBody.
 func newGeminiCaptureServer(t *testing.T, capture *geminiCapture, respBody string) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		capture.path = r.URL.Path
 		capture.auth = r.Header.Get("x-goog-api-key")
 		capture.contentType = r.Header.Get("Content-Type")
-		b, _ := io.ReadAll(r.Body)
 		var body geminiRequest
-		if err := json.Unmarshal(b, &body); err != nil {
+		if err := decodeTestBody(r, &body); err != nil {
 			t.Errorf("decode request body: %v", err)
 		}
 		capture.bodies = append(capture.bodies, body)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, respBody)
-	}))
-	t.Cleanup(srv.Close)
+	})
 	return srv
 }
 
@@ -233,11 +231,7 @@ func checkGeminiNoThinkingLevel(t *testing.T, cfg *geminiGenConfig) {
 // TestGeminiComplete_RateLimit429 verifies a 429 upstream response surfaces as
 // a typed chat.RateLimitError so the API layer can apply cooldown.
 func TestGeminiComplete_RateLimit429(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		io.WriteString(w, `{"error":{"code":429,"message":"rate limited","status":"RESOURCE_EXHAUSTED"}}`)
-	}))
-	defer srv.Close()
+	srv := newStaticStatusServer(t, http.StatusTooManyRequests, `{"error":{"code":429,"message":"rate limited","status":"RESOURCE_EXHAUSTED"}}`)
 
 	p := NewGeminiProvider(srv.URL, "test-key", 5*time.Second)
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -259,12 +253,9 @@ func TestGeminiComplete_RateLimit429(t *testing.T) {
 // generationConfig are omitted when unset.
 func TestGeminiComplete_OmitsOptionals(t *testing.T) {
 	var gotBody geminiRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &gotBody)
-		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
-	}))
-	defer srv.Close()
+	srv := newCaptureJSONServer(t, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`, func(r *http.Request) {
+		_ = decodeTestBody(r, &gotBody)
+	})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 	if _, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -285,26 +276,17 @@ func TestGeminiComplete_OmitsOptionals(t *testing.T) {
 // finishReason mapping, usage capture, and the final delta.
 func TestGeminiStream_ChunkParsing(t *testing.T) {
 	var gotPath, gotQuery string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotQuery = r.URL.RawQuery
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]}}]}\n\n")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":7,\"totalTokenCount\":12}}\n\n")
-	}))
-	defer srv.Close()
+	srv := newCaptureSSEServer(t, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n"+
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]}}]}\n\n"+
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":7,\"totalTokenCount\":12}}\n\n",
+		func(r *http.Request) {
+			gotPath = r.URL.Path
+			gotQuery = r.URL.RawQuery
+		})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "gemini-2.5-flash",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("gemini-2.5-flash"))
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -336,7 +318,7 @@ func TestGeminiStream_ChunkParsing(t *testing.T) {
 // content is delivered surfaces as a FinishReason "error" delta and Stream
 // returns nil.
 func TestGeminiStream_ErrorAfterFirstDelta(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n")
 		if f, ok := w.(http.Flusher); ok {
@@ -350,19 +332,11 @@ func TestGeminiStream_ErrorAfterFirstDelta(t *testing.T) {
 				_ = conn.Close()
 			}
 		}
-	}))
-	defer srv.Close()
+	})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "gemini-2.5-flash",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("gemini-2.5-flash"))
 	if err != nil {
 		t.Fatalf("Stream should return nil after content, got %v", err)
 	}
@@ -418,22 +392,12 @@ func TestGeminiEndpoint(t *testing.T) {
 // TestGeminiStream_EmptyTextParts verifies empty text parts are skipped and a
 // final delta is still emitted.
 func TestGeminiStream_EmptyTextParts(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]}}]}\n\n")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n")
-	}))
-	defer srv.Close()
+	srv := newSSEServer(t, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]}}]}\n\n"+
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n")
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
-	var deltas []chat.StreamDelta
-	if err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "gemini-2.5-flash",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	}); err != nil {
+	deltas, err := collectStream(t, p, simpleUserRequest("gemini-2.5-flash"))
+	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	if len(deltas) != 1 {
@@ -452,14 +416,11 @@ func TestGeminiStream_EmptyTextParts(t *testing.T) {
 // name/description/parameters, and that existing fields are preserved.
 func TestGeminiRequest_ToolsSerialization(t *testing.T) {
 	var gotBody geminiRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(b, &gotBody); err != nil {
+	srv := newCaptureJSONServer(t, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`, func(r *http.Request) {
+		if err := decodeTestBody(r, &gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)
 		}
-		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 	if _, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -508,9 +469,7 @@ func TestGeminiRequest_ToolsSerialization(t *testing.T) {
 // carrying functionCall parts maps to ChatResponse.ToolCalls and forces
 // FinishReason to "tool_calls".
 func TestGeminiComplete_FunctionCallParsing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{
+	srv := newStaticJSONServer(t, `{
 			"candidates":[{"content":{"role":"model","parts":[
 				{"text":"Let me check"},
 				{"functionCall":{"name":"get_weather","args":{"location":"Boston"}}}
@@ -518,8 +477,6 @@ func TestGeminiComplete_FunctionCallParsing(t *testing.T) {
 			"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8},
 			"responseId":"resp-fc"
 		}`)
-	}))
-	defer srv.Close()
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 	resp, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -560,14 +517,11 @@ func TestGeminiComplete_FunctionCallParsing(t *testing.T) {
 // parts carrying matching ids.
 func TestGemini_ToolRoundTripBody(t *testing.T) {
 	var gotBody geminiRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(b, &gotBody); err != nil {
+	srv := newCaptureJSONServer(t, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`, func(r *http.Request) {
+		if err := decodeTestBody(r, &gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)
 		}
-		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 	if _, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -642,12 +596,9 @@ func TestGemini_ToolRoundTripBody(t *testing.T) {
 // is a JSON object is used verbatim as the functionResponse object.
 func TestGemini_ToolResultJSONResponse(t *testing.T) {
 	var gotBody geminiRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &gotBody)
-		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
-	}))
-	defer srv.Close()
+	srv := newCaptureJSONServer(t, `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`, func(r *http.Request) {
+		_ = decodeTestBody(r, &gotBody)
+	})
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
 	if _, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -683,21 +634,13 @@ func TestGemini_ToolResultJSONResponse(t *testing.T) {
 // functionCall part yields a final StreamDelta with FinishReason "tool_calls"
 // and the collected ToolCalls.
 func TestGeminiStream_FunctionCall(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"location\":\"Jakarta\"}}}]},\"finishReason\":\"STOP\"}]}\n\n")
-	}))
-	defer srv.Close()
+	srv := newSSEServer(t, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"location\":\"Jakarta\"}}}]},\"finishReason\":\"STOP\"}]}\n\n")
 
 	p := NewGeminiProvider(srv.URL, "k", 5*time.Second)
-	var deltas []chat.StreamDelta
-	if err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "gemini-2.5-flash",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "weather?"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	}); err != nil {
+	req := simpleUserRequest("gemini-2.5-flash")
+	req.Messages[0].Content = "weather?"
+	deltas, err := collectStream(t, p, req)
+	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 

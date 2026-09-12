@@ -27,8 +27,7 @@ type anthropicCaptureRequest struct {
 
 func newTestProvider(t *testing.T, handler http.HandlerFunc) (*httptest.Server, chat.Provider) {
 	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
+	srv := newMockServer(t, handler)
 	return srv, NewAnthropicProvider(srv.URL, "test-key", "2023-06-01", 5*time.Second)
 }
 
@@ -41,7 +40,7 @@ func TestAnthropicComplete_Translation(t *testing.T) {
 		if r.URL.Path != "/messages" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		if err := decodeTestBody(r, &got); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -197,17 +196,14 @@ func TestAnthropicComplete_Thinking(t *testing.T) {
 func runAnthropicThinkingCase(t *testing.T, tt anthropicThinkingCase) {
 	t.Helper()
 	var got anthropicCaptureRequest
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeTestBody(r, &got)
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	defer srv.Close()
 
-	_, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model:           tt.model,
-		ReasoningEffort: tt.effort,
-		Messages:        []chat.Message{{Role: chat.RoleUser, Content: "x"}},
-	})
+	req := simpleUserRequest(tt.model)
+	req.ReasoningEffort = tt.effort
+	_, err := p.Complete(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -256,17 +252,14 @@ func strPtr(s string) *string { return &s }
 func TestAnthropicComplete_ExplicitMaxTokens(t *testing.T) {
 	mt := 4096
 	var got *anthropicCaptureRequest
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeTestBody(r, &got)
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"max_tokens","usage":{"input_tokens":1,"output_tokens":2}}`))
 	})
-	defer srv.Close()
 
-	resp, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model:     "claude-haiku-4-5",
-		MaxTokens: &mt,
-		Messages:  []chat.Message{{Role: chat.RoleUser, Content: "x"}},
-	})
+	req := simpleUserRequest("claude-haiku-4-5")
+	req.MaxTokens = &mt
+	resp, err := p.Complete(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -280,16 +273,12 @@ func TestAnthropicComplete_ExplicitMaxTokens(t *testing.T) {
 
 func TestAnthropicComplete_NoSystemNoTemp(t *testing.T) {
 	var got *anthropicCaptureRequest
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeTestBody(r, &got)
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	defer srv.Close()
 
-	_, err := p.Complete(context.Background(), chat.ChatRequest{
-		Model:    "claude-haiku-4-5",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "x"}},
-	})
+	_, err := p.Complete(context.Background(), simpleUserRequest("claude-haiku-4-5"))
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -327,24 +316,16 @@ func TestAnthropicStream_TextDeltaAndFinish(t *testing.T) {
 	}, "\n")
 
 	var got *anthropicCaptureRequest
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept") != "text/event-stream" {
 			t.Errorf("Accept = %q", r.Header.Get("Accept"))
 		}
-		_ = json.NewDecoder(r.Body).Decode(&got)
+		_ = decodeTestBody(r, &got)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(stream))
 	})
-	defer srv.Close()
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "claude-sonnet-4-6",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "Hi"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("claude-sonnet-4-6"))
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -384,20 +365,12 @@ func TestAnthropicStream_ErrorAfterText(t *testing.T) {
 		``,
 	}, "\n")
 
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(stream))
 	})
-	defer srv.Close()
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "claude-sonnet-4-6",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "Hi"}},
-	}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("claude-sonnet-4-6"))
 	if err != nil {
 		t.Fatalf("Stream should return nil after text delivered, got %v", err)
 	}
@@ -419,31 +392,23 @@ func TestAnthropicStream_ErrorBeforeText(t *testing.T) {
 		``,
 	}, "\n")
 
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(stream))
 	})
-	defer srv.Close()
 
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "claude-sonnet-4-6",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "Hi"}},
-	}, func(d chat.StreamDelta) error { return nil })
+	_, err := collectStream(t, p, simpleUserRequest("claude-sonnet-4-6"))
 	if err == nil {
 		t.Fatal("expected error before any text delivered")
 	}
 }
 
 func TestAnthropicStream_TransportError(t *testing.T) {
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`, http.StatusUnauthorized)
 	})
-	defer srv.Close()
 
-	err := p.Stream(context.Background(), chat.ChatRequest{
-		Model:    "claude-sonnet-4-6",
-		Messages: []chat.Message{{Role: chat.RoleUser, Content: "Hi"}},
-	}, func(d chat.StreamDelta) error { return nil })
+	_, err := collectStream(t, p, simpleUserRequest("claude-sonnet-4-6"))
 	if err == nil {
 		t.Fatal("expected transport error")
 	}
@@ -466,13 +431,12 @@ func TestAnthropic_ToolRoundTripBody(t *testing.T) {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := decodeTestBody(r, &got); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	defer srv.Close()
 
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
 		Model: "claude-sonnet-4-6",
@@ -533,11 +497,10 @@ func TestAnthropic_ToolRoundTripInvalidArgs(t *testing.T) {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeTestBody(r, &got)
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	defer srv.Close()
 
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
 		Model: "claude-sonnet-4-6",
@@ -571,11 +534,10 @@ func TestAnthropic_ToolRoundTripInvalidArgs(t *testing.T) {
 
 func TestAnthropicComplete_ToolsSerialization(t *testing.T) {
 	var got anthropicCaptureRequest
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeTestBody(r, &got)
 		_, _ = w.Write([]byte(`{"id":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	defer srv.Close()
 
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
 		Model:    "claude-sonnet-4-6",
@@ -616,7 +578,7 @@ func TestAnthropicComplete_ToolsSerialization(t *testing.T) {
 }
 
 func TestAnthropicComplete_ToolUseResponse(t *testing.T) {
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"msg_tool","type":"message","role":"assistant","model":"claude-sonnet-4-6",
@@ -628,7 +590,6 @@ func TestAnthropicComplete_ToolUseResponse(t *testing.T) {
 			"usage":{"input_tokens":20,"output_tokens":10}
 		}`))
 	})
-	defer srv.Close()
 
 	resp, err := p.Complete(context.Background(), chat.ChatRequest{
 		Model:    "claude-sonnet-4-6",
@@ -687,11 +648,10 @@ func TestAnthropicStream_ToolUse(t *testing.T) {
 		``,
 	}, "\n")
 
-	srv, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	_, p := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(stream))
 	})
-	defer srv.Close()
 
 	var deltas []chat.StreamDelta
 	err := p.Stream(context.Background(), chat.ChatRequest{

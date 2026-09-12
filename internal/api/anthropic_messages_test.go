@@ -52,36 +52,21 @@ func anthropicTestServer(t *testing.T, providers map[string]chat.Provider) http.
 }
 
 func TestAnthropicMessages_NonStreamHappyPath(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			if req.Model != "m1" {
-				t.Errorf("Complete got model %q, want m1", req.Model)
-			}
-			return chat.ChatResponse{
-				ID:           "resp-1",
-				Model:        "m1",
-				Content:      "hi",
-				FinishReason: "stop",
-				Usage:        chat.Usage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8},
-			}, nil
-		},
-	}
+	p1 := anthropicCompleteProvider("p1", chat.ChatResponse{
+		ID:           "resp-1",
+		Model:        "m1",
+		Content:      "hi",
+		FinishReason: "stop",
+		Usage:        chat.Usage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8},
+	}, func(req chat.ChatRequest) {
+		if req.Model != "m1" {
+			t.Errorf("Complete got model %q, want m1", req.Model)
+		}
+	})
 	h := anthropicTestServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
-		"model":      "virtual-a",
-		"max_tokens": 1024,
-		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
-	})
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	var out anthropicTestMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", anthropicMessagesBody("virtual-a", 1024, "hi"))
+	out := decodeSuccessfulAnthropicMessage(t, rec)
 	if out.Type != "message" {
 		t.Errorf("type = %q, want message", out.Type)
 	}
@@ -103,34 +88,18 @@ func TestAnthropicMessages_NonStreamHappyPath(t *testing.T) {
 }
 
 func TestAnthropicMessages_ToolCalls(t *testing.T) {
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(context.Context, chat.ChatRequest) (chat.ChatResponse, error) {
-			return chat.ChatResponse{
-				FinishReason: "tool_calls",
-				ToolCalls: []chat.ToolCall{{
-					ID:        "call_1",
-					Name:      "search_web",
-					Arguments: json.RawMessage(`{"query":"news"}`),
-				}},
-			}, nil
-		},
-	}
+	p1 := anthropicCompleteProvider("p1", chat.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls: []chat.ToolCall{{
+			ID:        "call_1",
+			Name:      "search_web",
+			Arguments: json.RawMessage(`{"query":"news"}`),
+		}},
+	}, nil)
 	h := anthropicTestServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
-		"model":      "virtual-a",
-		"max_tokens": 1024,
-		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
-	})
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	var out anthropicTestMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", anthropicMessagesBody("virtual-a", 1024, "hi"))
+	out := decodeSuccessfulAnthropicMessage(t, rec)
 	if out.StopReason != "tool_use" {
 		t.Errorf("stop_reason = %q, want tool_use", out.StopReason)
 	}
@@ -179,19 +148,8 @@ func TestAnthropic_ServerToolExecuted(t *testing.T) {
 		{Name: "virtual-a", Strategy: "failover", Candidates: []config.ModelCandidate{{Provider: "p1", Model: "m1"}}},
 	}, tr)
 
-	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
-		"model":      "virtual-a",
-		"max_tokens": 1024,
-		"messages":   []map[string]any{{"role": "user", "content": "cuaca hari ini?"}},
-	})
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	var out anthropicTestMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", anthropicMessagesBody("virtual-a", 1024, "cuaca hari ini?"))
+	out := decodeSuccessfulAnthropicMessage(t, rec)
 	if out.StopReason != "end_turn" {
 		t.Errorf("stop_reason = %q, want end_turn", out.StopReason)
 	}
@@ -220,23 +178,13 @@ func TestAnthropic_ServerToolExecuted(t *testing.T) {
 
 func TestAnthropicMessages_MaxTokensDefault(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
+	p1 := anthropicCompleteProvider("p1", chat.ChatResponse{Content: "ok", FinishReason: "stop"}, func(request chat.ChatRequest) {
+		got = request
+	})
 	h := anthropicTestServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
-		"model":    "virtual-a",
-		"messages": []map[string]any{{"role": "user", "content": "hi"}},
-	})
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", anthropicMessagesBody("virtual-a", 0, "hi"))
+	decodeSuccessfulAnthropicMessage(t, rec)
 	if got.MaxTokens == nil || *got.MaxTokens != 1024 {
 		t.Errorf("MaxTokens = %v, want 1024", got.MaxTokens)
 	}
@@ -244,24 +192,15 @@ func TestAnthropicMessages_MaxTokensDefault(t *testing.T) {
 
 func TestAnthropicMessages_ContentAsArray(t *testing.T) {
 	var got chat.ChatRequest
-	p1 := &fakeProvider{
-		name: "p1",
-		complete: func(_ context.Context, req chat.ChatRequest) (chat.ChatResponse, error) {
-			got = req
-			return chat.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
-		},
-	}
+	p1 := anthropicCompleteProvider("p1", chat.ChatResponse{Content: "ok", FinishReason: "stop"}, func(request chat.ChatRequest) {
+		got = request
+	})
 	h := anthropicTestServer(t, map[string]chat.Provider{"p1": p1})
 
-	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", map[string]any{
-		"model":      "virtual-a",
-		"max_tokens": 1024,
-		"messages":   []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "hello"}}}},
-	})
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
+	rec := doJSON(t, h, http.MethodPost, "/anthropic/v1/messages", anthropicMessagesBody("virtual-a", 1024,
+		[]map[string]any{{"type": "text", "text": "hello"}},
+	))
+	decodeSuccessfulAnthropicMessage(t, rec)
 	if len(got.Messages) != 1 || got.Messages[0].Content != "hello" {
 		t.Errorf("messages = %+v, want content hello", got.Messages)
 	}
@@ -279,10 +218,7 @@ func TestAnthropicMessages_ModelNotFoundReturns404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
-	var errResp anthropicTestError
-	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
-		t.Fatalf("decode error: %v", err)
-	}
+	errResp := decodeAnthropicError(t, rec)
 	if errResp.Type != "error" {
 		t.Errorf("type = %q, want error", errResp.Type)
 	}

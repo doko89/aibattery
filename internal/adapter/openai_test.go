@@ -17,7 +17,7 @@ import (
 func captureRequest(t *testing.T, r *http.Request) openAIRequest {
 	t.Helper()
 	var body openAIRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeTestBody(r, &body); err != nil {
 		t.Fatalf("decode request body: %v", err)
 	}
 	return body
@@ -34,7 +34,7 @@ type openAICapture struct {
 // checks path/method, records the request into capture, and replies with respBody.
 func newOpenAICompleteServer(t *testing.T, capture *openAICapture, respBody string) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
@@ -47,8 +47,7 @@ func newOpenAICompleteServer(t *testing.T, capture *openAICapture, respBody stri
 
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, respBody)
-	}))
-	t.Cleanup(srv.Close)
+	})
 	return srv
 }
 
@@ -62,6 +61,10 @@ const openAICompleteStub = `{
 	}],
 	"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
 }`
+
+// openAIMinimalOKStub is the minimal successful chat-completion payload reused
+// by the tests that only assert on the outgoing request body.
+const openAIMinimalOKStub = `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
 
 func assertOpenAIHeaders(t *testing.T, capture *openAICapture) {
 	t.Helper()
@@ -215,12 +218,9 @@ func checkOpenAITemperatureDropped(t *testing.T, got openAIRequest) {
 
 func TestOpenAI_ReasoningContentBody(t *testing.T) {
 	var got openAIRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCaptureJSONServer(t, openAIMinimalOKStub, func(r *http.Request) {
 		got = captureRequest(t, r)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -255,12 +255,9 @@ func TestOpenAI_ReasoningContentBody(t *testing.T) {
 
 func TestOpenAI_ToolRoundTripBody(t *testing.T) {
 	var got openAIRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCaptureJSONServer(t, openAIMinimalOKStub, func(r *http.Request) {
 		got = captureRequest(t, r)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -323,15 +320,12 @@ func TestOpenAI_ToolRoundTripBody(t *testing.T) {
 
 func TestComplete_OmitEmptyFields(t *testing.T) {
 	var got openAIRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCaptureJSONServer(t, openAIMinimalOKStub, func(r *http.Request) {
 		got = captureRequest(t, r)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	_, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	_, err := p.Complete(context.Background(), simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -347,14 +341,10 @@ func TestComplete_OmitEmptyFields(t *testing.T) {
 }
 
 func TestComplete_TransportError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
-	}))
-	defer srv.Close()
+	srv := newStaticStatusServer(t, http.StatusTooManyRequests, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	_, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	_, err := p.Complete(context.Background(), simpleUserRequest("m"))
 	if err == nil {
 		t.Fatal("expected error for 429")
 	}
@@ -368,12 +358,9 @@ func TestComplete_TransportError(t *testing.T) {
 
 func TestComplete_SerializesTools(t *testing.T) {
 	var got openAIRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCaptureJSONServer(t, openAIMinimalOKStub, func(r *http.Request) {
 		got = captureRequest(t, r)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"m","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 	_, err := p.Complete(context.Background(), chat.ChatRequest{
@@ -415,31 +402,27 @@ func TestComplete_SerializesTools(t *testing.T) {
 }
 
 func TestComplete_ParsesToolCalls(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{
-			"id": "chatcmpl-tc",
-			"model": "gpt-4o-mini",
-			"choices": [{
-				"index": 0,
-				"message": {
-					"role": "assistant",
-					"content": null,
-					"tool_calls": [{
-						"id": "call_abc123",
-						"type": "function",
-						"function": {"name": "get_weather", "arguments": "{\"location\":\"Jakarta\"}"}
-					}]
-				},
-				"finish_reason": "tool_calls"
-			}],
-			"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
-		}`)
-	}))
-	defer srv.Close()
+	srv := newStaticJSONServer(t, `{
+		"id": "chatcmpl-tc",
+		"model": "gpt-4o-mini",
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [{
+					"id": "call_abc123",
+					"type": "function",
+					"function": {"name": "get_weather", "arguments": "{\"location\":\"Jakarta\"}"}
+				}]
+			},
+			"finish_reason": "tool_calls"
+		}],
+		"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+	}`)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	resp, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	resp, err := p.Complete(context.Background(), simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -465,25 +448,17 @@ func TestComplete_ParsesToolCalls(t *testing.T) {
 }
 
 func TestStream_ToolCallAccumulation(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, ""+
-			"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n"+
-			"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"loc\"}}]}}]}\n\n"+
-			"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ation\\\":\\\"Jakarta\\\"}\"}}]}}]}\n\n"+
-			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
-			"data: [DONE]\n\n",
-		)
-	}))
-	defer srv.Close()
+	srv := newSSEServer(t, ""+
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n"+
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"loc\"}}]}}]}\n\n"+
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ation\\\":\\\"Jakarta\\\"}\"}}]}}]}\n\n"+
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
+		"data: [DONE]\n\n",
+	)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -514,27 +489,20 @@ func TestStream_SSEParsing(t *testing.T) {
 	var got openAIRequest
 	var gotAccept string
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = captureRequest(t, r)
-		gotAccept = r.Header.Get("Accept")
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, ""+
-			"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"+
-			"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n"+
-			"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n"+
-			"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n"+
-			"data: [DONE]\n\n",
-		)
-	}))
-	defer srv.Close()
+	srv := newCaptureSSEServer(t, ""+
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"+
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n"+
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n"+
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n"+
+		"data: [DONE]\n\n",
+		func(r *http.Request) {
+			got = captureRequest(t, r)
+			gotAccept = r.Header.Get("Accept")
+		})
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -567,16 +535,10 @@ func TestStream_SSEParsing(t *testing.T) {
 }
 
 func TestStream_ErrorBeforeFirstDelta(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		fmt.Fprint(w, `{"error":{"message":"slow down"}}`)
-	}))
-	defer srv.Close()
+	srv := newStaticStatusServer(t, http.StatusTooManyRequests, `{"error":{"message":"slow down"}}`)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(chat.StreamDelta) error {
-		return nil
-	})
+	_, err := collectStream(t, p, simpleUserRequest("m"))
 	if err == nil {
 		t.Fatal("expected error for 429 stream")
 	}
@@ -589,23 +551,15 @@ func TestStream_ErrorBeforeFirstDelta(t *testing.T) {
 }
 
 func TestStream_ErrorAfterFirstDelta(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		// Emit one content delta, then a malformed frame.
-		fmt.Fprint(w, ""+
-			"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"+
-			"data: not-json\n\n",
-		)
-	}))
-	defer srv.Close()
+	// Emit one content delta, then a malformed frame.
+	srv := newSSEServer(t, ""+
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"+
+		"data: not-json\n\n",
+	)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
 
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Stream should return nil after first delta, got %v", err)
 	}
@@ -621,32 +575,28 @@ func TestStream_ErrorAfterFirstDelta(t *testing.T) {
 }
 
 func TestOpenAI_ReasoningContentResponse(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{
-			"id": "chatcmpl-r",
-			"model": "deepseek-v4-pro",
-			"choices": [{
-				"index": 0,
-				"message": {
-					"role": "assistant",
-					"content": null,
-					"reasoning_content": "thinking...",
-					"tool_calls": [{
-						"id": "call_1",
-						"type": "function",
-						"function": {"name": "search_web", "arguments": "{\"query\":\"x\"}"}
-					}]
-				},
-				"finish_reason": "tool_calls"
-			}],
-			"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
-		}`)
-	}))
-	defer srv.Close()
+	srv := newStaticJSONServer(t, `{
+		"id": "chatcmpl-r",
+		"model": "deepseek-v4-pro",
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"reasoning_content": "thinking...",
+				"tool_calls": [{
+					"id": "call_1",
+					"type": "function",
+					"function": {"name": "search_web", "arguments": "{\"query\":\"x\"}"}
+				}]
+			},
+			"finish_reason": "tool_calls"
+		}],
+		"usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+	}`)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	resp, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	resp, err := p.Complete(context.Background(), simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -680,18 +630,10 @@ const openAIReasoningPlainContentFrames = "" +
 // the resulting deltas.
 func streamOpenAIReasoning(t *testing.T, frames string) []chat.StreamDelta {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, frames)
-	}))
-	t.Cleanup(srv.Close)
+	srv := newSSEServer(t, frames)
 
 	p := NewOpenAIProvider(srv.URL, "k", time.Second)
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -762,7 +704,7 @@ func TestOpenAI_StreamTimeoutBudget(t *testing.T) {
 	// Provider timeout is tiny (30ms); the upstream thinks for 100ms before the
 	// first chunk. Streaming must NOT be bound by the provider timeout: it uses
 	// the generous streamTimeout budget, so this must succeed.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		time.Sleep(100 * time.Millisecond)
 		fmt.Fprint(w, ""+
@@ -770,15 +712,10 @@ func TestOpenAI_StreamTimeoutBudget(t *testing.T) {
 			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
 			"data: [DONE]\n\n",
 		)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", 30*time.Millisecond)
-	var deltas []chat.StreamDelta
-	err := p.Stream(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}}, func(d chat.StreamDelta) error {
-		deltas = append(deltas, d)
-		return nil
-	})
+	deltas, err := collectStream(t, p, simpleUserRequest("m"))
 	if err != nil {
 		t.Fatalf("Stream returned error %v; streaming must not be bound by the provider timeout", err)
 	}
@@ -791,15 +728,14 @@ func TestOpenAI_CompleteRespectsTimeout(t *testing.T) {
 	// The upstream sleeps longer than the provider timeout; Complete must fail
 	// with a context deadline error (the configured timeout is a per-call
 	// budget, not a total http.Client deadline).
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		time.Sleep(200 * time.Millisecond)
 		fmt.Fprint(w, `{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
-	}))
-	defer srv.Close()
+	})
 
 	p := NewOpenAIProvider(srv.URL, "k", 30*time.Millisecond)
-	_, err := p.Complete(context.Background(), chat.ChatRequest{Model: "m", Messages: []chat.Message{{Role: chat.RoleUser, Content: "hi"}}})
+	_, err := p.Complete(context.Background(), simpleUserRequest("m"))
 	if err == nil {
 		t.Fatal("Complete succeeded; want timeout error")
 	}
