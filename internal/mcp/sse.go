@@ -138,27 +138,11 @@ func (t *SSETransport) Do(ctx context.Context, req RequestMessage, expectsRespon
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get(headerMcpSessionID); sid != "" {
+	return finishDoResponse(resp, req.ID, expectsResponse, func(sid string) {
 		t.mu.Lock()
 		t.sessionID = sid
 		t.mu.Unlock()
-	}
-
-	if !expectsResponse || resp.StatusCode == http.StatusAccepted {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, nil
-	}
-
-	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "text/event-stream") {
-		return parseSSEResponse(resp.Body, req.ID)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("mcp: read response: %w", err)
-	}
-	return parseResponse(data)
+	})
 }
 
 func (t *SSETransport) Close(context.Context) error { return nil }

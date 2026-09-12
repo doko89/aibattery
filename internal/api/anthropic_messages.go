@@ -225,19 +225,12 @@ func (s *Server) completeAnthropic(w http.ResponseWriter, r *http.Request, sel r
 			sel.RecordFailure(cand)
 			continue
 		}
-		s.rememberReasoning(session, &resp)
-		final, err := s.executeServerTools(ctx, p, &cReq, &resp, clientToolNames, session)
-		if err != nil {
-			s.deps.Logger.Warn("provider completion failed during tool loop",
-				"virtual_model", virtualModel, "provider", cand.ProviderName, "model", cand.Model, "error", err)
-			sel.RecordFailure(cand)
+		final, ok := s.finishCandidate(ctx, p, &cReq, resp, completeCandidateEnv{
+			sel: sel, cand: cand, clientToolNames: clientToolNames, session: session, virtualModel: virtualModel,
+		})
+		if !ok {
 			continue
 		}
-		sel.RecordSuccess(cand)
-		s.deps.Logger.Info("completion served",
-			"virtual_model", virtualModel,
-			"provider", cand.ProviderName,
-			"model", cand.Model)
 		writeAnthropicMessage(w, cand.Model, *final)
 		return
 	}

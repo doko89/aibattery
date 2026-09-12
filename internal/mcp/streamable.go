@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"sync"
 )
 
@@ -49,7 +47,7 @@ func (t *streamableTransport) Do(ctx context.Context, req RequestMessage, expect
 	}
 	t.mu.Lock()
 	if t.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", t.sessionID)
+		httpReq.Header.Set(headerMcpSessionID, t.sessionID)
 	}
 	t.mu.Unlock()
 
@@ -60,28 +58,11 @@ func (t *streamableTransport) Do(ctx context.Context, req RequestMessage, expect
 	defer resp.Body.Close()
 
 	// Capture and echo the session id on subsequent requests.
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+	return finishDoResponse(resp, req.ID, expectsResponse, func(sid string) {
 		t.mu.Lock()
 		t.sessionID = sid
 		t.mu.Unlock()
-	}
-
-	// Notifications (and 202 Accepted) carry no JSON-RPC response body.
-	if !expectsResponse || resp.StatusCode == http.StatusAccepted {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, nil
-	}
-
-	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "text/event-stream") {
-		return parseSSEResponse(resp.Body, req.ID)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("mcp: read response: %w", err)
-	}
-	return parseResponse(data)
+	})
 }
 
 func (t *streamableTransport) Close(context.Context) error { return nil }
